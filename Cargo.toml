@@ -1,0 +1,39 @@
+[package]
+name = "ping-tokio"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+license = "BSD-2-Clause"
+description = "Async ICMP ping library for Rust, built on Tokio and raw sockets."
+repository = "https://github.com/ogital-net/ping-tokio"
+homepage = "https://github.com/ogital-net/ping-tokio"
+documentation = "https://docs.rs/ping-tokio"
+readme = "README.md"
+keywords = ["ping", "icmp", "async", "tokio", "network"]
+categories = ["network-programming", "asynchronous"]
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+]
+
+[features]
+bin = ["tokio/macros"]
+
+[[bin]]
+name = "ping"
+path = "src/bin/ping.rs"
+required-features = ["bin"]
+
+[dependencies]
+libc = "0.2"
+socket2 = "0.6"
+tokio = { version = "1", default-features = false, features = ["net", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
