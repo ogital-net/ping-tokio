@@ -42,10 +42,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-features --all-targets
 
+  cross:
+    # Guard against platform-specific `#[cfg]` gating regressions. This only
+    # runs `cargo check` (no linker needed), so we can validate targets we
+    # don't have runners for. FreeBSD is the primary "other Unix" we support;
+    # add more Unix targets here as their `libc`/`socket2` support allows.
+    name: cross-check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-freebsd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-features --all-targets --target ${{ matrix.target }} -- -D warnings
+
   test:
-    # Tests that open raw ICMP sockets need CAP_NET_RAW on Linux, which we
-    # don't have in CI. Filter them out by name; the remaining tests cover
-    # header construction, checksum, statistics, and address resolution.
+    # The crate now opens unprivileged ICMP datagram (ping) sockets before
+    # falling back to raw sockets, so the full suite can run without root or
+    # CAP_NET_RAW on both platforms — provided the caller's group is within
+    # `net.ipv4.ping_group_range` on Linux. GitHub-hosted Ubuntu runners give
+    # us passwordless sudo, so we widen that range before running the tests.
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -56,9 +78,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: test (Linux — skip raw socket tests)
+      - name: Allow unprivileged ICMP (Linux)
         if: runner.os == 'Linux'
-        run: cargo test --all-features --lib --bins -- --skip net::tests --skip test_send_icmp
-      - name: test (macOS — full suite, SOCK_DGRAM works without root)
-        if: runner.os == 'macOS'
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+      - name: test (full suite — unprivileged ping sockets)
         run: cargo test --all-features --lib --bins

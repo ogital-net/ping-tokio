@@ -27,7 +27,7 @@ pub(crate) mod time;
 
 use std::{
     mem::MaybeUninit,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddrV6},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
     sync::{
         atomic::{AtomicU16, Ordering},
         LazyLock,
@@ -36,6 +36,7 @@ use std::{
 };
 
 pub use net::IcmpSocket;
+use net::SocketType;
 use socket2::{MaybeUninitSlice, MsgHdrMut, SockAddr};
 use tokio::time::timeout;
 
@@ -56,7 +57,7 @@ const ICMP6_ECHO_REPLY: u8 = 129;
 // to disambiguate replies on a shared raw ICMP socket; reply matching also
 // validates `seq` and the echoed timestamp payload, so this seed only needs
 // to spread starting points around the 16-bit space, not be cryptographic.
-static REQ_ID: LazyLock<AtomicU16> = LazyLock::new(|| {
+pub(crate) static REQ_ID: LazyLock<AtomicU16> = LazyLock::new(|| {
     let pid = u64::from(std::process::id());
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -246,10 +247,27 @@ pub async fn send_icmp_echo_v4(
     seq: u16,
     tout: Duration,
 ) -> std::io::Result<IcmpEchoReply> {
-    let mut buf: Vec<u8> = Vec::with_capacity(
-        IP_HEADER_SIZE + ICMP_HEADER_SIZE + time::Timestamp::len() + payload.len(),
-    );
-    let req_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
+    let sock_type = socket.sock_type();
+    let ts_len = time::Timestamp::len();
+
+    // On Linux `SOCK_DGRAM` ping sockets, the kernel uses the bound port as
+    // the ICMP identifier. We must use the same id in the packet header AND
+    // the bound port. The socket already bound with this id in `bind()`.
+    let req_id = match socket.dgram_ident() {
+        Some(id) => id,
+        None => REQ_ID.fetch_add(1, Ordering::Relaxed),
+    };
+
+    // Allocate a single buffer used for both send and receive, like the v6
+    // path. For RAW sockets, received data includes a 20-byte IP header;
+    // add that overhead so the buffer never truncates.
+    let icmp_len = ICMP_HEADER_SIZE + ts_len + payload.len();
+    let buf_cap = match sock_type {
+        SocketType::Dgram => icmp_len,
+        SocketType::Raw => IP_HEADER_SIZE + icmp_len,
+    };
+    let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
+
     add_icmp_header(&mut buf, ICMP_ECHO_REQUEST, req_id, seq);
     let sent_ts_bytes = time::Timestamp::now().as_bytes();
     buf.extend_from_slice(&sent_ts_bytes);
@@ -260,12 +278,36 @@ pub async fn send_icmp_echo_v4(
     buf[3] = (checksum & 0xff) as u8;
 
     socket.send(&buf).await?;
+
+    // For DGRAM sockets, we receive via recvmsg to get TTL from IP_TTL cmsg.
+    // For RAW sockets, we receive via recv and parse the IP header ourselves.
+    match sock_type {
+        SocketType::Dgram => {
+            send_icmp_echo_v4_dgram(socket, req_id, seq, sent_ts_bytes, buf, tout).await
+        }
+        SocketType::Raw => {
+            send_icmp_echo_v4_raw(socket, req_id, seq, sent_ts_bytes, buf, tout).await
+        }
+    }
+}
+
+/// Receive path for `SOCK_RAW`: IP header is present in the data.
+async fn send_icmp_echo_v4_raw(
+    socket: &IcmpSocket,
+    req_id: u16,
+    seq: u16,
+    sent_ts_bytes: [u8; 8],
+    mut buf: Vec<u8>,
+    tout: Duration,
+) -> std::io::Result<IcmpEchoReply> {
+    let ts_len = time::Timestamp::len();
+
     let overall = timeout(tout, async {
         loop {
             buf.clear();
             let received = socket.recv(buf.spare_capacity_mut()).await?;
             unsafe { buf.set_len(received) };
-            if received < IP_HEADER_SIZE + ICMP_HEADER_SIZE + time::Timestamp::len() {
+            if received < IP_HEADER_SIZE + ICMP_HEADER_SIZE + ts_len {
                 continue;
             }
             let msg_type = buf[IP_HEADER_SIZE];
@@ -280,11 +322,8 @@ pub async fn send_icmp_echo_v4(
             if reply_seq != seq {
                 continue;
             }
-            // Validate the echoed timestamp matches what we sent. This is the
-            // strongest filter against another raw-ICMP user on this host
-            // happening to use the same id while pinging the same peer.
             let ts_start = IP_HEADER_SIZE + ICMP_HEADER_SIZE;
-            let ts_end = ts_start + time::Timestamp::len();
+            let ts_end = ts_start + ts_len;
             if buf[ts_start..ts_end] != sent_ts_bytes {
                 continue;
             }
@@ -302,6 +341,111 @@ pub async fn send_icmp_echo_v4(
             return Ok(IcmpEchoReply {
                 src_addr,
                 len: received - IP_HEADER_SIZE,
+                seq: reply_seq,
+                ttl: reply_ttl,
+                rtt,
+            });
+        }
+    });
+
+    match overall.await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        )),
+    }
+}
+
+/// Receive path for `SOCK_DGRAM`: no IP header; TTL via `IP_TTL` cmsg.
+async fn send_icmp_echo_v4_dgram(
+    socket: &IcmpSocket,
+    req_id: u16,
+    seq: u16,
+    sent_ts_bytes: [u8; 8],
+    mut buf: Vec<u8>,
+    tout: Duration,
+) -> std::io::Result<IcmpEchoReply> {
+    let ts_len = time::Timestamp::len();
+
+    // The kernel delivers the source address in the `msg_name` field and TTL
+    // in an `IP_TTL` control message (enabled via `IP_RECVTTL` in `bind()`).
+    // The storage is sized to comfortably exceed `CMSG_SPACE(sizeof(int))`
+    // and is backed by `u64` to satisfy `cmsghdr` alignment; `MSG_CTRUNC` is
+    // checked below in case a future change adds more cmsgs and overflows it.
+    let mut control_storage: [MaybeUninit<u64>; 8] = [MaybeUninit::uninit(); 8];
+    let mut from: SockAddr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0u16).into();
+
+    let overall = timeout(tout, async {
+        loop {
+            buf.clear();
+
+            let (received, flags, reply_ttl_opt) = {
+                let bufs = &mut [MaybeUninitSlice::new(buf.spare_capacity_mut())];
+                let control_bytes: &mut [MaybeUninit<u8>] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        control_storage.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                        std::mem::size_of_val(&control_storage),
+                    )
+                };
+                let mut msg = MsgHdrMut::new()
+                    .with_addr(&mut from)
+                    .with_control(control_bytes)
+                    .with_buffers(bufs);
+
+                let received = socket.recvmsg(&mut msg).await?;
+                // SAFETY: `MsgHdrMut` is `#[repr(transparent)]` over `libc::msghdr`
+                let hdr: &libc::msghdr = unsafe { &*(&raw const msg as *const libc::msghdr) };
+                let flags = hdr.msg_flags;
+                let ttl = decode_ip_ttl(hdr);
+                (received, flags, ttl)
+            };
+            unsafe { buf.set_len(received) };
+
+            if flags & libc::MSG_CTRUNC != 0 {
+                return Err(std::io::Error::other(
+                    "recvmsg control buffer truncated (MSG_CTRUNC)",
+                ));
+            }
+
+            if received < ICMP_HEADER_SIZE + ts_len {
+                continue;
+            }
+            // On DGRAM ping sockets, the ICMP message starts at byte 0 (no IP header).
+            let msg_type = buf[0];
+            if msg_type != ICMP_ECHO_REPLY {
+                continue;
+            }
+            let reply_id = u16::from_be_bytes([buf[4], buf[5]]);
+            if req_id != reply_id {
+                continue;
+            }
+            let reply_seq = u16::from_be_bytes([buf[6], buf[7]]);
+            if reply_seq != seq {
+                continue;
+            }
+            let ts_end = ICMP_HEADER_SIZE + ts_len;
+            if buf[ICMP_HEADER_SIZE..ts_end] != sent_ts_bytes {
+                continue;
+            }
+            let now = time::Timestamp::now();
+            let src_addr = from.as_socket_ipv4().map(|s| *s.ip()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "recvmsg returned no source address",
+                )
+            })?;
+            // If the kernel didn't attach an `IP_TTL` cmsg (e.g. an older
+            // kernel that rejected `IP_RECVTTL`), fall back to 0 rather than
+            // dropping the reply. This mirrors iputils `ping(8)`, which only
+            // warns on `setsockopt(IP_RECVTTL)` failure and reports ttl 0.
+            let reply_ttl = reply_ttl_opt.unwrap_or(0);
+            let reply_ts =
+                time::Timestamp::from(<[u8; 8]>::try_from(&buf[ICMP_HEADER_SIZE..ts_end]).unwrap());
+            let rtt = now - reply_ts;
+            return Ok(IcmpEchoReply {
+                src_addr,
+                len: received,
                 seq: reply_seq,
                 ttl: reply_ttl,
                 rtt,
@@ -340,7 +484,12 @@ pub async fn send_icmp_echo_v6(
 ) -> std::io::Result<IcmpV6EchoReply> {
     let mut buf: Vec<u8> =
         Vec::with_capacity(ICMP_HEADER_SIZE + time::Timestamp::len() + payload.len());
-    let req_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
+    // On Linux `SOCK_DGRAM` ping sockets, the kernel uses the bound port as
+    // the ICMP identifier. We use the socket's pre-bound ident if available.
+    let req_id = match socket.dgram_ident() {
+        Some(id) => id,
+        None => REQ_ID.fetch_add(1, Ordering::Relaxed),
+    };
     add_icmp_header(&mut buf, ICMP6_ECHO_REQUEST, req_id, seq);
     let sent_ts_bytes = time::Timestamp::now().as_bytes();
     buf.extend_from_slice(&sent_ts_bytes);
@@ -524,6 +673,41 @@ fn calculate_checksum(data: &[u8]) -> u16 {
     {
         !sum as u16
     }
+}
+
+/// Extract the `IP_TTL` ancillary value from a received message on a
+/// `SOCK_DGRAM` (ping) socket.
+///
+/// When using ping sockets on Linux, the kernel delivers TTL via the
+/// `IP_TTL` control message instead of in the IP header (which is stripped).
+/// Returns `None` if no matching cmsg was present or the value did not fit
+/// in a `u8`.
+fn decode_ip_ttl(hdr: &libc::msghdr) -> Option<u8> {
+    // SAFETY: `hdr` is a valid `*const msghdr` whose `msg_control` /
+    // `msg_controllen` were written by the kernel during `recvmsg`. The
+    // `CMSG_*` macros expect exactly this.
+    let want_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) } as usize;
+    let mut p = unsafe { libc::CMSG_FIRSTHDR(hdr) };
+    while !p.is_null() {
+        let h = unsafe { &*p };
+        if h.cmsg_level == libc::IPPROTO_IP
+            && h.cmsg_type == libc::IP_TTL
+            && h.cmsg_len as usize >= want_len
+        {
+            let mut value = MaybeUninit::<libc::c_int>::uninit();
+            let ttl = unsafe {
+                std::ptr::copy_nonoverlapping(
+                    libc::CMSG_DATA(p),
+                    value.as_mut_ptr().cast::<u8>(),
+                    std::mem::size_of::<libc::c_int>(),
+                );
+                value.assume_init()
+            };
+            return u8::try_from(ttl).ok();
+        }
+        p = unsafe { libc::CMSG_NXTHDR(hdr, p) };
+    }
+    None
 }
 
 /// Extract the `IPV6_HOPLIMIT` ancillary value from a received message.

@@ -8,15 +8,67 @@ use tokio::io::Interest;
 
 use crate::addr::ToIpAddr;
 
+/// Whether the ICMP socket was created via `SOCK_DGRAM` or `SOCK_RAW`.
+///
+/// This determines how received data is interpreted:
+/// - `Raw`: The kernel delivers the full IP packet; an IP header precedes the
+///   ICMP message. TTL is read from the IP header directly.
+/// - `Dgram`: The kernel strips the IP header; the ICMP message starts at
+///   byte 0. TTL must be retrieved via `IP_RECVTTL` / `IP_TTL` control
+///   messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SocketType {
+    Raw,
+    Dgram,
+}
+
+/// The result of creating an ICMP socket: the raw socket plus its type.
+struct NewSocket {
+    socket: Socket,
+    sock_type: SocketType,
+}
+
 /// Create a socket suitable for ICMP communication.
 ///
-/// On Apple platforms, uses `SOCK_DGRAM` when running without root privileges
-/// and `SOCK_RAW` when running as root. This mirrors `ping(8)` and `ping6(8)`
-/// on macOS, which both use `getuid()` to select the socket type at creation
-/// time. `SOCK_DGRAM` with `IPPROTO_ICMP`/`IPPROTO_ICMPV6` supports sending
-/// and receiving ICMP echo requests without root.
+/// On **Linux**, tries `SOCK_DGRAM` (ping socket) first. If that fails with
+/// `EACCES` (user not in `net.ipv4.ping_group_range`), `EAFNOSUPPORT`, or
+/// `EPROTONOSUPPORT`, falls back to `SOCK_RAW`. This mirrors the strategy
+/// used by iputils `ping(8)`.
+///
+/// On **Apple platforms**, uses `SOCK_DGRAM` when running without root
+/// privileges and `SOCK_RAW` when running as root — matching macOS
+/// `ping(8)` and `ping6(8)`. `SOCK_DGRAM` with `IPPROTO_ICMP`/`IPPROTO_ICMPV6`
+/// works for all users on macOS.
+///
 /// On all other platforms, `SOCK_RAW` is used unconditionally.
-fn new_icmp_socket(domain: Domain, protocol: Protocol) -> std::io::Result<Socket> {
+fn new_icmp_socket(domain: Domain, protocol: Protocol) -> std::io::Result<NewSocket> {
+    #[cfg(any(target_os = "linux", target_os = "android",))]
+    {
+        let sock = Socket::new(domain, Type::DGRAM, Some(protocol));
+        match sock {
+            Ok(socket) => {
+                return Ok(NewSocket {
+                    socket,
+                    sock_type: SocketType::Dgram,
+                });
+            }
+            Err(e) => {
+                let fallback = matches!(
+                    e.raw_os_error(),
+                    Some(libc::EACCES | libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT)
+                );
+                if fallback {
+                    let raw = Socket::new(domain, Type::RAW, Some(protocol))?;
+                    return Ok(NewSocket {
+                        socket: raw,
+                        sock_type: SocketType::Raw,
+                    });
+                }
+                return Err(e);
+            }
+        }
+    }
+
     #[cfg(any(
         target_os = "macos",
         target_os = "ios",
@@ -25,11 +77,23 @@ fn new_icmp_socket(domain: Domain, protocol: Protocol) -> std::io::Result<Socket
         target_os = "visionos",
     ))]
     if !is_root() {
-        // macOS ping(8) and ping6(8) both select SOCK_DGRAM when getuid() != 0.
-        return Socket::new(domain, Type::DGRAM, Some(protocol));
+        return Ok(NewSocket {
+            socket: Socket::new(domain, Type::DGRAM, Some(protocol))?,
+            sock_type: SocketType::Dgram,
+        });
     }
 
-    Socket::new(domain, Type::RAW, Some(protocol))
+    // All platforms: fallback / default path uses SOCK_RAW.
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android",),
+        allow(unreachable_code)
+    )]
+    {
+        Ok(NewSocket {
+            socket: Socket::new(domain, Type::RAW, Some(protocol))?,
+            sock_type: SocketType::Raw,
+        })
+    }
 }
 
 /// Returns `true` if the current process is running as root (uid 0).
@@ -45,7 +109,7 @@ fn is_root() -> bool {
     unsafe { libc::getuid() == 0 }
 }
 
-/// Asynchronous, non-blocking ICMP raw socket.
+/// Asynchronous, non-blocking ICMP socket.
 ///
 /// Wraps a [`socket2::Socket`] in [`tokio::io::unix::AsyncFd`] so that send
 /// and receive operations integrate with the Tokio runtime. Supports both
@@ -59,48 +123,108 @@ fn is_root() -> bool {
 /// | Platform | ICMPv4 | ICMPv6 |
 /// |---|---|---|
 /// | **macOS** | No privileges needed (`SOCK_DGRAM`) | No privileges needed (`SOCK_DGRAM`) |
-/// | **Linux** | `CAP_NET_RAW` or `ping_group_range` | `CAP_NET_RAW` or `ping_group_range` |
+/// | **Linux** | `net.ipv4.ping_group_range` or `CAP_NET_RAW` | Same |
 /// | **FreeBSD** / **NetBSD** / **OpenBSD** | Root | Root |
 ///
-/// On Apple platforms, this library automatically uses a datagram
+/// On **Apple platforms**, this library automatically uses a datagram
 /// (`SOCK_DGRAM`) socket when not running as root — the same approach used
-/// by macOS `ping(8)` and `ping6(8)`. This allows both ICMPv4 and ICMPv6
-/// pings without root. When running as root, `SOCK_RAW` is used.
+/// by macOS `ping(8)` and `ping6(8)`. When running as root, `SOCK_RAW` is
+/// used.
 ///
-/// On Linux, unprivileged users can create ICMP sockets if the kernel's
-/// `net.ipv4.ping_group_range` sysctl includes their group. No automatic
-/// fallback is attempted; the caller receives the OS error.
+/// On **Linux**, a `SOCK_DGRAM` (ping) socket is tried first. If the user's
+/// group is not in the kernel's `net.ipv4.ping_group_range` sysctl, the
+/// kernel returns `EACCES` and the library falls back to `SOCK_RAW` (which
+/// requires `CAP_NET_RAW`). This mirrors the strategy used by iputils
+/// `ping(8)`.
 pub struct IcmpSocket {
     io: AsyncFd<Socket>,
+    sock_type: SocketType,
+    /// On `SOCK_DGRAM` (ping) sockets on Linux, the kernel uses the bound
+    /// port as the ICMP echo identifier. This field stores that port so the
+    /// receive path can check it. `None` on `SOCK_RAW` sockets where the
+    /// identifier is written directly into the ICMP packet header.
+    dgram_ident: Option<u16>,
 }
 
 impl IcmpSocket {
-    /// Create a new ICMP raw socket bound to `addr`.
+    /// Create a new ICMP socket bound to `addr`.
     ///
     /// The address family of `addr` (after resolution) determines whether an
     /// ICMPv4 or ICMPv6 socket is created. The socket is placed in
     /// non-blocking mode and registered with the current Tokio runtime.
     ///
-    /// On Apple platforms when not running as root, uses `SOCK_DGRAM` for
+    /// On **Apple platforms** when not running as root, uses `SOCK_DGRAM` for
     /// both ICMPv4 and ICMPv6 (matching macOS `ping(8)` / `ping6(8)`).
-    /// When running as root, `SOCK_RAW` is used. On all other platforms
-    /// `SOCK_RAW` is used unconditionally.
+    /// When running as root, `SOCK_RAW` is used.
+    ///
+    /// On **Linux**, a `SOCK_DGRAM` (ping) socket is tried first, with
+    /// automatic fallback to `SOCK_RAW` if the kernel denies the ping socket
+    /// (e.g. the user is not in `net.ipv4.ping_group_range`).
     pub async fn bind<A: ToIpAddr>(addr: A) -> std::io::Result<IcmpSocket> {
         let ip_addr = addr.to_ip_addr().await?;
-        let (sock_addr, domain, protocol) = match ip_addr {
-            std::net::IpAddr::V4(ipv4_addr) => (
-                SocketAddr::V4(SocketAddrV4::new(ipv4_addr, 0u16)),
-                Domain::IPV4,
-                Protocol::ICMPV4,
-            ),
-            std::net::IpAddr::V6(ipv6_addr) => (
-                SocketAddr::V6(SocketAddrV6::new(ipv6_addr, 0u16, 0, 0)),
-                Domain::IPV6,
-                Protocol::ICMPV6,
-            ),
+        let (domain, protocol) = match ip_addr {
+            std::net::IpAddr::V4(_) => (Domain::IPV4, Protocol::ICMPV4),
+            std::net::IpAddr::V6(_) => (Domain::IPV6, Protocol::ICMPV6),
         };
-        let socket = new_icmp_socket(domain, protocol)?;
+        let NewSocket { socket, sock_type } = new_icmp_socket(domain, protocol)?;
         socket.set_nonblocking(true)?;
+
+        // On `SOCK_DGRAM` ping sockets on Linux, the kernel uses the bound
+        // port as the ICMP echo identifier — the id field in the packet
+        // header is ignored. We must bind with a specific non-zero port
+        // so we can recognise our own replies. This mirrors iputils ping's
+        // `sin_port = rts->ident` / `sin6_port = rts->ident` logic in
+        // `ping4_run()` / `ping6_run()`.
+        //
+        // On Apple platforms, the kernel correctly uses the packet's id
+        // field, so the port doesn't matter — we keep port 0 and rely on
+        // the `req_id` written into the ICMP header by the caller.
+        //
+        // We use the same `REQ_ID` counter that `send_icmp_echo_v4` /
+        // `send_icmp_echo_v6` will write into the packet header, keeping
+        // the two in sync.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let dgram_ident = if sock_type == SocketType::Dgram {
+            use std::sync::atomic::Ordering;
+            // SAFETY: `REQ_ID` is a global lazily-initialized atomic; safe to
+            // access from any async context. The counter wraps naturally at 2^16.
+            //
+            // Skip id 0: the kernel interprets a bind port of 0 as "pick a
+            // random port", which defeats the purpose. We fetch the next
+            // value rather than mapping 0 -> 1 so we don't bias id 1 (which
+            // would otherwise be produced both naturally and by remapping).
+            let ident = loop {
+                let candidate = crate::REQ_ID.fetch_add(1, Ordering::Relaxed);
+                if candidate != 0 {
+                    break candidate;
+                }
+            };
+            Some(ident)
+        } else {
+            None
+        };
+
+        // On non-Linux platforms, DGRAM sockets use the packet's id field
+        // for matching, not the port.
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let dgram_ident: Option<u16> = None;
+
+        // On datagram (ping) sockets on Linux, request TTL via ancillary data
+        // since the kernel strips the IP header. On macOS DGRAM sockets this
+        // is a no-op (harmless setsockopt that returns an error we ignore).
+        if sock_type == SocketType::Dgram && domain == Domain::IPV4 {
+            let hold: libc::c_int = 1;
+            let _ = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_RECVTTL,
+                    (&raw const hold).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+        }
+
         if domain == Domain::IPV6 {
             socket.set_recv_hoplimit_v6(true)?;
         }
@@ -137,9 +261,28 @@ impl IcmpSocket {
             set_dont_fragment(&socket, domain, true)?;
         }
 
+        // Build the bind address. On Linux `SOCK_DGRAM` ping sockets the port
+        // carries the ICMP identifier (see `dgram_ident` above); everywhere
+        // else the port is 0 and the identifier lives in the packet header.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let bind_port = dgram_ident.unwrap_or(0);
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let bind_port = 0u16;
+        let sock_addr = match ip_addr {
+            std::net::IpAddr::V4(ipv4_addr) => {
+                SocketAddr::V4(SocketAddrV4::new(ipv4_addr, bind_port))
+            }
+            std::net::IpAddr::V6(ipv6_addr) => {
+                SocketAddr::V6(SocketAddrV6::new(ipv6_addr, bind_port, 0, 0))
+            }
+        };
         socket.bind(&sock_addr.into())?;
         let io = AsyncFd::new(socket)?;
-        Ok(Self { io })
+        Ok(Self {
+            io,
+            sock_type,
+            dgram_ident,
+        })
     }
 
     /// Connect this socket to `addr` so that subsequent `send`/`recv` calls
@@ -153,6 +296,24 @@ impl IcmpSocket {
             }
         };
         self.io.get_ref().connect(&socket_addr.into())
+    }
+
+    /// Returns the socket type (`Raw` or `Dgram`) used for this ICMP socket.
+    ///
+    /// When `Dgram`, the receive path must skip IP-header parsing and retrieve
+    /// TTL/hop-limit from ancillary data instead.
+    pub(crate) fn sock_type(&self) -> SocketType {
+        self.sock_type
+    }
+
+    /// Returns the ICMP identifier bound to this socket's datagram port.
+    ///
+    /// On Linux `SOCK_DGRAM` ping sockets, the kernel derives the ICMP echo
+    /// identifier from the bound port, ignoring the id field in the packet
+    /// header. This returns that port (ident). On `SOCK_RAW` sockets and
+    /// non-Linux platforms, returns `None`.
+    pub(crate) fn dgram_ident(&self) -> Option<u16> {
+        self.dgram_ident
     }
 
     /// Wait for the socket to become ready for the given [`Interest`].
