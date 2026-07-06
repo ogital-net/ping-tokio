@@ -36,10 +36,10 @@ use std::{
 };
 
 pub use net::IcmpSocket;
-use socket2::{MaybeUninitSlice, SockAddr};
+use socket2::{MaybeUninitSlice, MsgHdrMut, SockAddr};
 use tokio::time::timeout;
 
-use crate::{addr::ToIpAddr, net::MsgHdrMut};
+use crate::addr::ToIpAddr;
 
 const IP_HEADER_SIZE: usize = 20;
 const ICMP_HEADER_SIZE: usize = 8;
@@ -379,8 +379,10 @@ pub async fn send_icmp_echo_v6(
                     .with_buffers(bufs);
 
                 let received = socket.recvmsg(&mut msg).await?;
-                let flags = msg.flags();
-                let hlim = decode_hlim(&msg);
+                // SAFETY: `MsgHdrMut` is `#[repr(transparent)]` over `libc::msghdr`
+                let hdr: &libc::msghdr = unsafe { &*(&raw const msg as *const libc::msghdr) };
+                let flags = hdr.msg_flags;
+                let hlim = decode_hlim(hdr);
                 (received, flags, hlim)
             };
             unsafe { buf.set_len(received) };
@@ -526,13 +528,12 @@ fn calculate_checksum(data: &[u8]) -> u16 {
 
 /// Extract the `IPV6_HOPLIMIT` ancillary value from a received message.
 ///
-/// Walks the control-message chain attached to `msg` using `CMSG_FIRSTHDR` /
+/// Walks the control-message chain attached to `hdr` using `CMSG_FIRSTHDR` /
 /// `CMSG_NXTHDR`, which is the only portable way to interpret a `recvmsg(2)`
 /// control buffer (it handles per-platform alignment and padding via the
 /// kernel-provided macros). Returns `None` if no matching cmsg was present
 /// or the value did not fit in a `u8`.
-fn decode_hlim(msg: &MsgHdrMut<'_, '_, '_>) -> Option<u8> {
-    let hdr = msg.as_msghdr();
+fn decode_hlim(hdr: &libc::msghdr) -> Option<u8> {
     // SAFETY: `hdr` is a valid `*const msghdr` whose `msg_control` /
     // `msg_controllen` were written by the kernel during `recvmsg`. The
     // `CMSG_*` macros expect exactly this.

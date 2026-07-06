@@ -1,131 +1,12 @@
-use std::fmt;
-use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::AsRawFd;
 
-use socket2::{Domain, Protocol, Socket, Type};
-use socket2::{MaybeUninitSlice, SockAddr};
+use socket2::{Domain, MsgHdrMut, Protocol, Socket, Type};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::io::Interest;
 
 use crate::addr::ToIpAddr;
-
-/// Configuration of a `recvmsg(2)` system call.
-///
-/// This wraps `msghdr` on Unix and `WSAMSG` on Windows. Also see [`MsgHdr`] for
-/// the variant used by `sendmsg(2)`.
-#[repr(transparent)]
-pub(crate) struct MsgHdrMut<'addr, 'bufs, 'control> {
-    inner: libc::msghdr,
-    #[allow(clippy::type_complexity)]
-    _lifetimes: PhantomData<(
-        &'addr mut SockAddr,
-        &'bufs mut MaybeUninitSlice<'bufs>,
-        &'control mut [u8],
-    )>,
-}
-
-#[cfg(not(any(target_os = "redox", target_os = "wasi")))]
-impl<'addr, 'bufs, 'control> MsgHdrMut<'addr, 'bufs, 'control> {
-    /// Create a new `MsgHdrMut` with all empty/zero fields.
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> MsgHdrMut<'addr, 'bufs, 'control> {
-        // SAFETY: all zero is valid for `msghdr` and `WSAMSG`.
-        MsgHdrMut {
-            inner: unsafe { std::mem::zeroed() },
-            _lifetimes: PhantomData,
-        }
-    }
-
-    /// Set the mutable address (name) of the message.
-    ///
-    /// Corresponds to setting `msg_name` and `msg_namelen` on Unix and `name`
-    /// and `namelen` on Windows.
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    pub fn with_addr(mut self, addr: &'addr mut SockAddr) -> Self {
-        Self::set_msghdr_name(&mut self.inner, addr);
-        self
-    }
-
-    /// Set the mutable buffer(s) of the message.
-    ///
-    /// Corresponds to setting `msg_iov` and `msg_iovlen` on Unix and `lpBuffers`
-    /// and `dwBufferCount` on Windows.
-    pub fn with_buffers(mut self, bufs: &'bufs mut [MaybeUninitSlice<'_>]) -> Self {
-        Self::set_msghdr_iov(&mut self.inner, bufs.as_mut_ptr().cast(), bufs.len());
-        self
-    }
-
-    /// Set the mutable control buffer of the message.
-    ///
-    /// Corresponds to setting `msg_control` and `msg_controllen` on Unix and
-    /// `Control` on Windows.
-    pub fn with_control(mut self, buf: &'control mut [MaybeUninit<u8>]) -> Self {
-        Self::set_msghdr_control(&mut self.inner, buf.as_mut_ptr().cast(), buf.len());
-        self
-    }
-
-    /// Gets the message flags written by `recvmsg(2)` (e.g. `MSG_CTRUNC`,
-    /// `MSG_TRUNC`).
-    pub fn flags(&self) -> libc::c_int {
-        self.inner.msg_flags
-    }
-
-    /// Returns a reference to the underlying `msghdr`.
-    ///
-    /// Provided so callers can use kernel macros like `CMSG_FIRSTHDR` /
-    /// `CMSG_NXTHDR`, which take a `*const msghdr` and use `msg_control` /
-    /// `msg_controllen` from it.
-    pub fn as_msghdr(&self) -> &libc::msghdr {
-        &self.inner
-    }
-
-    fn set_msghdr_name(msg: &mut libc::msghdr, name: &SockAddr) {
-        msg.msg_name = name.as_ptr() as *mut _;
-        msg.msg_namelen = name.len();
-    }
-
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))]
-    fn set_msghdr_iov(msg: &mut libc::msghdr, ptr: *mut libc::iovec, len: usize) {
-        msg.msg_iov = ptr;
-        msg.msg_iovlen = std::cmp::min(len, libc::c_int::MAX as usize) as libc::c_int;
-    }
-
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "l4re",
-        target_os = "android",
-        target_os = "emscripten"
-    ))]
-    fn set_msghdr_iov(msg: &mut libc::msghdr, ptr: *mut libc::iovec, len: usize) {
-        msg.msg_iov = ptr;
-        msg.msg_iovlen = len;
-    }
-
-    fn set_msghdr_control(msg: &mut libc::msghdr, ptr: *mut libc::c_void, len: usize) {
-        msg.msg_control = ptr;
-        msg.msg_controllen = len as _;
-    }
-}
-
-unsafe impl Send for MsgHdrMut<'_, '_, '_> {}
-
-impl fmt::Debug for MsgHdrMut<'_, '_, '_> {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        "MsgHdrMut".fmt(fmt)
-    }
-}
 
 /// Asynchronous, non-blocking ICMP raw socket.
 ///
@@ -218,22 +99,8 @@ impl IcmpSocket {
 
     pub(crate) async fn recvmsg(&self, msg: &mut MsgHdrMut<'_, '_, '_>) -> std::io::Result<usize> {
         self.io
-            .async_io(Interest::READABLE, |s| recvmsg(s, msg, 0))
+            .async_io(Interest::READABLE, |s| s.recvmsg(msg, 0))
             .await
-    }
-}
-
-fn recvmsg(
-    socket: &Socket,
-    msg: &mut MsgHdrMut<'_, '_, '_>,
-    flags: libc::c_int,
-) -> std::io::Result<usize> {
-    let fd = socket.as_raw_fd();
-    let res = unsafe { libc::recvmsg(fd, &raw mut msg.inner, flags) };
-    if res == -1 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(res as usize)
     }
 }
 
