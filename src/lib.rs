@@ -27,13 +27,17 @@ pub(crate) mod time;
 
 use std::{
     mem::MaybeUninit,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV6},
     sync::{
         atomic::{AtomicU16, Ordering},
         LazyLock,
     },
     time::Duration,
 };
+// `SocketAddrV4` is only used by the Linux/Android header-stripping DGRAM
+// receive path (`send_icmp_echo_v4_dgram`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::net::SocketAddrV4;
 
 pub use net::IcmpSocket;
 use net::SocketType;
@@ -258,13 +262,29 @@ pub async fn send_icmp_echo_v4(
         None => REQ_ID.fetch_add(1, Ordering::Relaxed),
     };
 
+    // Only Linux/Android ping sockets (`SOCK_DGRAM` + `IPPROTO_ICMP`) strip
+    // the IP header and deliver TTL via an `IP_TTL` control message. On Apple
+    // platforms a `SOCK_DGRAM` ICMP socket still delivers the full IP header,
+    // exactly like a raw socket (Apple's own `ping(8)` parses `struct ip`
+    // even in the datagram case). Treat those like `Raw` for both buffer
+    // sizing and the receive path, otherwise the header-stripped parser reads
+    // the IP version byte as the ICMP type, never matches a reply, and times
+    // out.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let dgram_strips_ip_header = true;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let dgram_strips_ip_header = false;
+    let use_dgram_recv = sock_type == SocketType::Dgram && dgram_strips_ip_header;
+
     // Allocate a single buffer used for both send and receive, like the v6
-    // path. For RAW sockets, received data includes a 20-byte IP header;
-    // add that overhead so the buffer never truncates.
+    // path. When the IP header is present in received data (RAW sockets, and
+    // Apple DGRAM sockets), add that 20-byte overhead so the buffer never
+    // truncates.
     let icmp_len = ICMP_HEADER_SIZE + ts_len + payload.len();
-    let buf_cap = match sock_type {
-        SocketType::Dgram => icmp_len,
-        SocketType::Raw => IP_HEADER_SIZE + icmp_len,
+    let buf_cap = if use_dgram_recv {
+        icmp_len
+    } else {
+        IP_HEADER_SIZE + icmp_len
     };
     let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
 
@@ -279,16 +299,16 @@ pub async fn send_icmp_echo_v4(
 
     socket.send(&buf).await?;
 
-    // For DGRAM sockets, we receive via recvmsg to get TTL from IP_TTL cmsg.
-    // For RAW sockets, we receive via recv and parse the IP header ourselves.
-    match sock_type {
-        SocketType::Dgram => {
-            send_icmp_echo_v4_dgram(socket, req_id, seq, sent_ts_bytes, buf, tout).await
-        }
-        SocketType::Raw => {
-            send_icmp_echo_v4_raw(socket, req_id, seq, sent_ts_bytes, buf, tout).await
-        }
+    // On header-stripping DGRAM sockets we receive via recvmsg to get TTL from
+    // the IP_TTL cmsg. Otherwise (RAW sockets and Apple DGRAM sockets) the IP
+    // header is present, so we recv and parse it ourselves. The dgram receive
+    // path only exists on Linux/Android, so gate the dispatch accordingly.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if use_dgram_recv {
+        return send_icmp_echo_v4_dgram(socket, req_id, seq, sent_ts_bytes, buf, tout).await;
     }
+
+    send_icmp_echo_v4_raw(socket, req_id, seq, sent_ts_bytes, buf, tout).await
 }
 
 /// Receive path for `SOCK_RAW`: IP header is present in the data.
@@ -357,7 +377,9 @@ async fn send_icmp_echo_v4_raw(
     }
 }
 
-/// Receive path for `SOCK_DGRAM`: no IP header; TTL via `IP_TTL` cmsg.
+/// Receive path for header-stripping `SOCK_DGRAM` ping sockets (Linux/Android):
+/// no IP header; TTL via `IP_TTL` cmsg.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 async fn send_icmp_echo_v4_dgram(
     socket: &IcmpSocket,
     req_id: u16,
@@ -682,6 +704,7 @@ fn calculate_checksum(data: &[u8]) -> u16 {
 /// `IP_TTL` control message instead of in the IP header (which is stripped).
 /// Returns `None` if no matching cmsg was present or the value did not fit
 /// in a `u8`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn decode_ip_ttl(hdr: &libc::msghdr) -> Option<u8> {
     // SAFETY: `hdr` is a valid `*const msghdr` whose `msg_control` /
     // `msg_controllen` were written by the kernel during `recvmsg`. The
