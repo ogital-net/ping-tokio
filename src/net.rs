@@ -8,6 +8,43 @@ use tokio::io::Interest;
 
 use crate::addr::ToIpAddr;
 
+/// Create a socket suitable for ICMP communication.
+///
+/// On Apple platforms, uses `SOCK_DGRAM` when running without root privileges
+/// and `SOCK_RAW` when running as root. This mirrors `ping(8)` and `ping6(8)`
+/// on macOS, which both use `getuid()` to select the socket type at creation
+/// time. `SOCK_DGRAM` with `IPPROTO_ICMP`/`IPPROTO_ICMPV6` supports sending
+/// and receiving ICMP echo requests without root.
+/// On all other platforms, `SOCK_RAW` is used unconditionally.
+fn new_icmp_socket(domain: Domain, protocol: Protocol) -> std::io::Result<Socket> {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+    ))]
+    if !is_root() {
+        // macOS ping(8) and ping6(8) both select SOCK_DGRAM when getuid() != 0.
+        return Socket::new(domain, Type::DGRAM, Some(protocol));
+    }
+
+    Socket::new(domain, Type::RAW, Some(protocol))
+}
+
+/// Returns `true` if the current process is running as root (uid 0).
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+))]
+fn is_root() -> bool {
+    // SAFETY: `getuid()` is always safe to call.
+    unsafe { libc::getuid() == 0 }
+}
+
 /// Asynchronous, non-blocking ICMP raw socket.
 ///
 /// Wraps a [`socket2::Socket`] in [`tokio::io::unix::AsyncFd`] so that send
@@ -15,8 +52,24 @@ use crate::addr::ToIpAddr;
 /// ICMPv4 and ICMPv6; the protocol is selected by the address family of the
 /// bind address.
 ///
-/// Creating an `IcmpSocket` requires permission to open raw sockets
-/// (e.g. `CAP_NET_RAW` on Linux, or running as root).
+/// # Platform-specific privileges
+///
+/// Creating an `IcmpSocket` for ICMP typically requires elevated privileges:
+///
+/// | Platform | ICMPv4 | ICMPv6 |
+/// |---|---|---|
+/// | **macOS** | No privileges needed (`SOCK_DGRAM`) | No privileges needed (`SOCK_DGRAM`) |
+/// | **Linux** | `CAP_NET_RAW` or `ping_group_range` | `CAP_NET_RAW` or `ping_group_range` |
+/// | **FreeBSD** / **NetBSD** / **OpenBSD** | Root | Root |
+///
+/// On Apple platforms, this library automatically uses a datagram
+/// (`SOCK_DGRAM`) socket when not running as root — the same approach used
+/// by macOS `ping(8)` and `ping6(8)`. This allows both ICMPv4 and ICMPv6
+/// pings without root. When running as root, `SOCK_RAW` is used.
+///
+/// On Linux, unprivileged users can create ICMP sockets if the kernel's
+/// `net.ipv4.ping_group_range` sysctl includes their group. No automatic
+/// fallback is attempted; the caller receives the OS error.
 pub struct IcmpSocket {
     io: AsyncFd<Socket>,
 }
@@ -27,6 +80,11 @@ impl IcmpSocket {
     /// The address family of `addr` (after resolution) determines whether an
     /// ICMPv4 or ICMPv6 socket is created. The socket is placed in
     /// non-blocking mode and registered with the current Tokio runtime.
+    ///
+    /// On Apple platforms when not running as root, uses `SOCK_DGRAM` for
+    /// both ICMPv4 and ICMPv6 (matching macOS `ping(8)` / `ping6(8)`).
+    /// When running as root, `SOCK_RAW` is used. On all other platforms
+    /// `SOCK_RAW` is used unconditionally.
     pub async fn bind<A: ToIpAddr>(addr: A) -> std::io::Result<IcmpSocket> {
         let ip_addr = addr.to_ip_addr().await?;
         let (sock_addr, domain, protocol) = match ip_addr {
@@ -41,13 +99,30 @@ impl IcmpSocket {
                 Protocol::ICMPV6,
             ),
         };
-        let socket = Socket::new(domain, Type::RAW, Some(protocol))?;
+        let socket = new_icmp_socket(domain, protocol)?;
         socket.set_nonblocking(true)?;
         if domain == Domain::IPV6 {
             socket.set_recv_hoplimit_v6(true)?;
         }
-        // options not exposed by socket2
-        set_dont_fragment(&socket, domain, true)?;
+        // `IP_DONTFRAG` / `IPV6_DONTFRAG`. On Apple platforms, `IP_DONTFRAG`
+        // works on an unprivileged `SOCK_DGRAM` ICMPv4 socket — macOS `ping(8)`
+        // likewise sets `IP_DONTFRAG` in its non-root path. Empirically,
+        // `IPV6_DONTFRAG` returns an error on an unprivileged `SOCK_DGRAM`
+        // ICMPv6 socket on macOS, so we skip it there. (Note: macOS `ping6(8)`
+        // itself applies `IPV6_DONTFRAG` unconditionally; this skip is our own
+        // workaround for the DGRAM-socket limitation, not a mirror of ping6.)
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos",
+        ))]
+        if domain == Domain::IPV6 && !is_root() {
+            // SOCK_DGRAM ICMPv6: IPV6_DONTFRAG is not supported here.
+        } else {
+            set_dont_fragment(&socket, domain, true)?;
+        }
 
         socket.bind(&sock_addr.into())?;
         let io = AsyncFd::new(socket)?;
