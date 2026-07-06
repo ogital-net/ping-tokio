@@ -111,16 +111,29 @@ impl IcmpSocket {
         // ICMPv6 socket on macOS, so we skip it there. (Note: macOS `ping6(8)`
         // itself applies `IPV6_DONTFRAG` unconditionally; this skip is our own
         // workaround for the DGRAM-socket limitation, not a mirror of ping6.)
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "watchos",
-            target_os = "visionos",
-        ))]
-        if domain == Domain::IPV6 && !is_root() {
-            // SOCK_DGRAM ICMPv6: IPV6_DONTFRAG is not supported here.
-        } else {
+        let skip_dontfrag = {
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "watchos",
+                target_os = "visionos",
+            ))]
+            {
+                domain == Domain::IPV6 && !is_root()
+            }
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "watchos",
+                target_os = "visionos",
+            )))]
+            {
+                false
+            }
+        };
+        if !skip_dontfrag {
             set_dont_fragment(&socket, domain, true)?;
         }
 
