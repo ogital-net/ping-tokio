@@ -43,13 +43,22 @@ jobs:
       - run: cargo build --all-features --all-targets
 
   test:
-    # Tests that open raw ICMP sockets need CAP_NET_RAW, which we don't have
-    # in CI. Filter them out by name; the remaining tests cover header
-    # construction, checksum, statistics, and address resolution.
-    name: test
-    runs-on: ubuntu-latest
+    # Tests that open raw ICMP sockets need CAP_NET_RAW on Linux, which we
+    # don't have in CI. Filter them out by name; the remaining tests cover
+    # header construction, checksum, statistics, and address resolution.
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features --lib --bins -- --skip net::tests --skip test_send_icmp
+      - name: test (Linux — skip raw socket tests)
+        if: runner.os == 'Linux'
+        run: cargo test --all-features --lib --bins -- --skip net::tests --skip test_send_icmp
+      - name: test (macOS — full suite, SOCK_DGRAM works without root)
+        if: runner.os == 'macOS'
+        run: cargo test --all-features --lib --bins
