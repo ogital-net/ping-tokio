@@ -12,7 +12,7 @@ Supports ICMPv4 and ICMPv6. Requires the process to have permission to open raw 
 
 ```toml
 [dependencies]
-ping-tokio = "0.2"
+ping-tokio = "0.3"
 tokio = { version = "1", features = ["rt", "macros"] }
 ```
 
