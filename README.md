@@ -14,7 +14,7 @@ back to raw sockets where required. See [Permissions](#permissions) for details.
 
 ```toml
 [dependencies]
-ping-tokio = "0.3"
+ping-tokio = "0.4"
 tokio = { version = "1", features = ["rt", "macros"] }
 ```
 
