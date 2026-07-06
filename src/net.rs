@@ -143,6 +143,7 @@ pub struct IcmpSocket {
     /// port as the ICMP echo identifier. This field stores that port so the
     /// receive path can check it. `None` on `SOCK_RAW` sockets where the
     /// identifier is written directly into the ICMP packet header.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     dgram_ident: Option<u16>,
 }
 
@@ -206,9 +207,7 @@ impl IcmpSocket {
 
         // On non-Linux platforms, DGRAM sockets use the packet's id field
         // for matching, not the port.
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let dgram_ident: Option<u16> = None;
-
+        //
         // On datagram (ping) sockets on Linux, request TTL via ancillary data
         // since the kernel strips the IP header. On macOS DGRAM sockets this
         // is a no-op (harmless setsockopt that returns an error we ignore).
@@ -281,6 +280,7 @@ impl IcmpSocket {
         Ok(Self {
             io,
             sock_type,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             dgram_ident,
         })
     }
@@ -310,8 +310,9 @@ impl IcmpSocket {
     ///
     /// On Linux `SOCK_DGRAM` ping sockets, the kernel derives the ICMP echo
     /// identifier from the bound port, ignoring the id field in the packet
-    /// header. This returns that port (ident). On `SOCK_RAW` sockets and
-    /// non-Linux platforms, returns `None`.
+    /// header. This returns that port (ident). On `SOCK_RAW` sockets, returns
+    /// `None`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn dgram_ident(&self) -> Option<u16> {
         self.dgram_ident
     }

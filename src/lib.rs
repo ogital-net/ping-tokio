@@ -257,10 +257,13 @@ pub async fn send_icmp_echo_v4(
     // On Linux `SOCK_DGRAM` ping sockets, the kernel uses the bound port as
     // the ICMP identifier. We must use the same id in the packet header AND
     // the bound port. The socket already bound with this id in `bind()`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let req_id = match socket.dgram_ident() {
         Some(id) => id,
         None => REQ_ID.fetch_add(1, Ordering::Relaxed),
     };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let req_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
 
     // Only Linux/Android ping sockets (`SOCK_DGRAM` + `IPPROTO_ICMP`) strip
     // the IP header and deliver TTL via an `IP_TTL` control message. On Apple
@@ -508,10 +511,13 @@ pub async fn send_icmp_echo_v6(
         Vec::with_capacity(ICMP_HEADER_SIZE + time::Timestamp::len() + payload.len());
     // On Linux `SOCK_DGRAM` ping sockets, the kernel uses the bound port as
     // the ICMP identifier. We use the socket's pre-bound ident if available.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let req_id = match socket.dgram_ident() {
         Some(id) => id,
         None => REQ_ID.fetch_add(1, Ordering::Relaxed),
     };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let req_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
     add_icmp_header(&mut buf, ICMP6_ECHO_REQUEST, req_id, seq);
     let sent_ts_bytes = time::Timestamp::now().as_bytes();
     buf.extend_from_slice(&sent_ts_bytes);
