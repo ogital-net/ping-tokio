@@ -650,28 +650,10 @@ fn add_icmp_header(buf: &mut Vec<u8>, typ: u8, id: u16, seq: u16) {
     buf.push(0);
 
     // id
-    #[cfg(target_endian = "big")]
-    {
-        buf.push((id & 0xff) as u8);
-        buf.push((id >> 8) as u8);
-    }
-    #[cfg(not(target_endian = "big"))]
-    {
-        buf.push((id >> 8) as u8);
-        buf.push((id & 0xff) as u8);
-    }
+    buf.extend_from_slice(&id.to_be_bytes());
 
     // sequence
-    #[cfg(target_endian = "big")]
-    {
-        buf.push((seq & 0xff) as u8);
-        buf.push((seq >> 8) as u8);
-    }
-    #[cfg(not(target_endian = "big"))]
-    {
-        buf.push((seq >> 8) as u8);
-        buf.push((seq & 0xff) as u8);
-    }
+    buf.extend_from_slice(&seq.to_be_bytes());
 }
 
 /// Calculate Internet Checksum (RFC 1071)
