@@ -5,6 +5,10 @@ use std::{
 
 use ping_tokio::{generate_payload, send_icmp_echo_v4, send_icmp_echo_v6, IcmpSocket};
 
+// Share the implementation without adding a public statistics API to the library.
+#[path = "../stats.rs"]
+mod stats;
+
 struct Args {
     /// Original destination string as typed by the user (for display).
     dest_str: String,
@@ -173,19 +177,11 @@ async fn run(args: Args) -> std::io::Result<()> {
     );
 
     if !rtts.is_empty() {
-        let min_ms = rtts.iter().min().unwrap().as_secs_f64() * 1000.0;
-        let max_ms = rtts.iter().max().unwrap().as_secs_f64() * 1000.0;
-        let avg_nanos = rtts.iter().map(|d| d.as_nanos() as u64).sum::<u64>() / rtts.len() as u64;
-        let avg_ms = Duration::from_nanos(avg_nanos).as_secs_f64() * 1000.0;
-        let variance = rtts
-            .iter()
-            .map(|d| {
-                let diff = d.as_nanos() as i64 - avg_nanos as i64;
-                (diff * diff) as u64
-            })
-            .sum::<u64>()
-            / rtts.len() as u64;
-        let stddev_ms = Duration::from_nanos(variance.isqrt()).as_secs_f64() * 1000.0;
+        let stats = stats::compute_rtt_stats(&rtts);
+        let min_ms = stats.rtt_min.as_secs_f64() * 1000.0;
+        let max_ms = stats.rtt_max.as_secs_f64() * 1000.0;
+        let avg_ms = stats.rtt_avg.as_secs_f64() * 1000.0;
+        let stddev_ms = stats.rtt_std_dev.as_secs_f64() * 1000.0;
 
         println!(
             "round-trip min/avg/max/stddev = {min_ms:.3}/{avg_ms:.3}/{max_ms:.3}/{stddev_ms:.3} ms"

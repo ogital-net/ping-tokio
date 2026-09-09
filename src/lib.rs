@@ -23,6 +23,7 @@
 /// Conversion from various inputs (IP addresses, hostnames) into [`std::net::IpAddr`].
 pub mod addr;
 mod net;
+mod stats;
 pub(crate) mod time;
 
 use std::{
@@ -45,6 +46,7 @@ use socket2::{MaybeUninitSlice, MsgHdrMut, SockAddr};
 use tokio::time::timeout;
 
 use crate::addr::ToIpAddr;
+use crate::stats::compute_rtt_stats;
 
 const IP_HEADER_SIZE: usize = 20;
 const ICMP_HEADER_SIZE: usize = 8;
@@ -172,48 +174,15 @@ pub async fn ping<A: ToIpAddr>(
     }
 
     let packets_tx = count;
-    let mut stats = compute_rtt_stats(&rtts);
-    stats.packets_tx = packets_tx;
-    stats.packets_rx = packets_rx;
-    Ok(stats)
-}
-
-/// Compute RTT statistics from a list of round-trip time samples.
-///
-/// `packets_tx` and `packets_rx` are left as `0`; the caller is responsible
-/// for filling them in.
-fn compute_rtt_stats(rtts: &[Duration]) -> PingStats {
-    let (rtt_min, rtt_avg, rtt_max, rtt_std_dev) = if rtts.is_empty() {
-        (
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
-        )
-    } else {
-        let min = *rtts.iter().min().unwrap();
-        let max = *rtts.iter().max().unwrap();
-        let avg_nanos = rtts.iter().map(|d| d.as_nanos() as u64).sum::<u64>() / rtts.len() as u64;
-        let avg = Duration::from_nanos(avg_nanos);
-        let variance = rtts
-            .iter()
-            .map(|d| {
-                let diff = d.as_nanos() as i64 - avg_nanos as i64;
-                (diff * diff) as u64
-            })
-            .sum::<u64>()
-            / rtts.len() as u64;
-        let std_dev = Duration::from_nanos(variance.isqrt());
-        (min, avg, max, std_dev)
-    };
-    PingStats {
-        packets_tx: 0,
-        packets_rx: 0,
-        rtt_min,
-        rtt_avg,
-        rtt_max,
-        rtt_std_dev,
-    }
+    let stats = compute_rtt_stats(&rtts);
+    Ok(PingStats {
+        packets_tx,
+        packets_rx,
+        rtt_min: stats.rtt_min,
+        rtt_avg: stats.rtt_avg,
+        rtt_max: stats.rtt_max,
+        rtt_std_dev: stats.rtt_std_dev,
+    })
 }
 
 /// The result of a successful ICMPv6 echo (ping) exchange.
@@ -842,7 +811,7 @@ mod tests {
 
     #[test]
     fn test_compute_rtt_stats_multiple() {
-        // 10ms, 20ms, 30ms  → avg=20ms, variance=66_666_666ns², std_dev=8164ns≈8μs
+        // 10ms, 20ms, 30ms -> mean 20ms, population std dev sqrt(200/3) ms.
         let rtts = vec![
             Duration::from_millis(10),
             Duration::from_millis(20),
@@ -852,24 +821,7 @@ mod tests {
         assert_eq!(stats.rtt_min, Duration::from_millis(10));
         assert_eq!(stats.rtt_max, Duration::from_millis(30));
         assert_eq!(stats.rtt_avg, Duration::from_millis(20));
-        // population std dev = sqrt(((10-20)²+(20-20)²+(30-20)²)/3) ms
-        //                    = sqrt(200/3) ms ≈ 8.165ms
-        let expected_std_dev_nanos: u64 = {
-            let avg_ns: u64 = 20_000_000;
-            let variance = [10_000_000u64, 20_000_000u64, 30_000_000u64]
-                .iter()
-                .map(|&d| {
-                    let diff = d as i64 - avg_ns as i64;
-                    (diff * diff) as u64
-                })
-                .sum::<u64>()
-                / 3;
-            variance.isqrt()
-        };
-        assert_eq!(
-            stats.rtt_std_dev,
-            Duration::from_nanos(expected_std_dev_nanos)
-        );
+        assert_eq!(stats.rtt_std_dev, Duration::from_nanos(8_164_966));
     }
 
     #[test]
