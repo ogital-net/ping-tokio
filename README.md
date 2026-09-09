@@ -56,7 +56,11 @@ The `size` parameter is the total ICMP payload size in bytes. The first 8 bytes 
 | `rtt_max`      | Maximum RTT                                      |
 | `rtt_std_dev`  | Population standard deviation of RTT samples     |
 
-Probes that time out are counted in `packets_tx` but not `packets_rx`. They do not cause the function to return an error.
+Requests successfully sent whose reply deadline expires are counted in
+`packets_tx` but not `packets_rx`. They do not cause `ping` to return an error.
+All operational errors (including send/receive errors and OS-reported timeouts)
+abort the run and are returned without partial statistics. `packets_tx` counts
+complete requests accepted by the local socket, not confirmed network delivery.
 
 ---
 

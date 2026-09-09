@@ -27,6 +27,7 @@ mod stats;
 pub(crate) mod time;
 
 use std::{
+    future::Future,
     mem::MaybeUninit,
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV6},
     sync::{
@@ -56,6 +57,58 @@ const ICMP_ECHO_REPLY: u8 = 0;
 const ICMP6_ECHO_REQUEST: u8 = 128;
 const ICMP6_ECHO_REPLY: u8 = 129;
 
+/// Both outcomes imply that the complete request was accepted by the socket.
+/// Operational errors, including OS-reported timeouts, remain `Err` values.
+#[derive(Debug)]
+enum ProbeOutcome<T> {
+    Reply(T),
+    ReplyTimedOut,
+}
+
+impl<T> ProbeOutcome<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> ProbeOutcome<U> {
+        match self {
+            Self::Reply(reply) => ProbeOutcome::Reply(f(reply)),
+            Self::ReplyTimedOut => ProbeOutcome::ReplyTimedOut,
+        }
+    }
+
+    /// Preserve the existing public low-level API's timeout representation.
+    fn into_result(self) -> std::io::Result<T> {
+        match self {
+            Self::Reply(reply) => Ok(reply),
+            Self::ReplyTimedOut => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out",
+            )),
+        }
+    }
+}
+
+/// Send one complete datagram before starting the reply deadline.
+async fn send_request(socket: &IcmpSocket, buf: &[u8]) -> std::io::Result<()> {
+    let sent = socket.send(buf).await?;
+    if sent != buf.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "socket did not send the complete ICMP request",
+        ));
+    }
+    Ok(())
+}
+
+/// Called only after a successful send. Only our deadline becomes packet loss;
+/// errors returned by the receive operation are propagated without alteration.
+async fn wait_for_reply<T>(
+    tout: Duration,
+    receive: impl Future<Output = std::io::Result<T>>,
+) -> std::io::Result<ProbeOutcome<T>> {
+    match timeout(tout, receive).await {
+        Ok(result) => result.map(ProbeOutcome::Reply),
+        Err(_) => Ok(ProbeOutcome::ReplyTimedOut),
+    }
+}
+
 // Seed `REQ_ID` from PID mixed with the low bits of the current wall-clock
 // time so two processes started with PIDs differing by a multiple of 65536
 // don't begin life with the same id, and so that restarting the same binary
@@ -78,7 +131,9 @@ pub(crate) static REQ_ID: LazyLock<AtomicU16> = LazyLock::new(|| {
 /// round-trip time statistics computed across all replied probes.
 #[derive(Clone, Copy, Debug)]
 pub struct PingStats {
-    /// Total number of ICMP echo requests transmitted.
+    /// Number of complete ICMP echo requests accepted by the local socket,
+    /// including requests whose reply deadline expired. This does not imply
+    /// delivery to the destination.
     pub packets_tx: u32,
     /// Number of ICMP echo replies received (i.e. non-timed-out probes).
     pub packets_rx: u32,
@@ -126,9 +181,11 @@ pub struct IcmpEchoReply {
 /// # Errors
 ///
 /// * [`std::io::ErrorKind::InvalidInput`] — `size` is 8 or fewer bytes.
-/// * Any I/O error from socket creation, binding, or connecting.
-/// * Individual probe timeouts are counted as lost packets and do **not** cause
-///   the function to return an error.
+/// * Any error from address resolution, socket creation, binding, connecting,
+///   sending, or receiving is returned immediately, without partial statistics.
+/// * Only expiration of a probe's reply deadline after a successful send is
+///   counted as packet loss. OS-reported I/O errors are propagated even if
+///   their kind is [`std::io::ErrorKind::TimedOut`].
 pub async fn ping<A: ToIpAddr>(
     src: A,
     dest: A,
@@ -152,19 +209,42 @@ pub async fn ping<A: ToIpAddr>(
     let socket = IcmpSocket::bind(src).await?;
     socket.connect(dest).await?;
 
+    run_probes(count, interval, |seq| {
+        let socket = &socket;
+        let payload = &payload;
+        async move {
+            match dest {
+                IpAddr::V4(_) => probe_icmp_echo_v4(socket, payload, seq, tout)
+                    .await
+                    .map(|outcome| outcome.map(|r| r.rtt)),
+                IpAddr::V6(_) => probe_icmp_echo_v6(socket, payload, seq, tout)
+                    .await
+                    .map(|outcome| outcome.map(|r| r.rtt)),
+            }
+        }
+    })
+    .await
+}
+
+/// Aggregate completed probes. A successful outcome implies a successful send;
+/// any operational error aborts the run instead of returning partial statistics.
+async fn run_probes<F, Fut>(
+    count: u32,
+    interval: Duration,
+    mut probe: F,
+) -> std::io::Result<PingStats>
+where
+    F: FnMut(u16) -> Fut,
+    Fut: Future<Output = std::io::Result<ProbeOutcome<Duration>>>,
+{
+    let mut packets_tx: u32 = 0;
     let mut packets_rx: u32 = 0;
     let mut rtts: Vec<Duration> = Vec::with_capacity(count as usize);
 
     for seq in 1..=count {
-        let result = match dest {
-            IpAddr::V4(_) => send_icmp_echo_v4(&socket, &payload, seq as u16, tout)
-                .await
-                .map(|r| r.rtt),
-            IpAddr::V6(_) => send_icmp_echo_v6(&socket, &payload, seq as u16, tout)
-                .await
-                .map(|r| r.rtt),
-        };
-        if let Ok(rtt) = result {
+        let outcome = probe(seq as u16).await?;
+        packets_tx += 1;
+        if let ProbeOutcome::Reply(rtt) = outcome {
             packets_rx += 1;
             rtts.push(rtt);
         }
@@ -173,7 +253,6 @@ pub async fn ping<A: ToIpAddr>(
         }
     }
 
-    let packets_tx = count;
     let stats = compute_rtt_stats(&rtts);
     Ok(PingStats {
         packets_tx,
@@ -220,6 +299,17 @@ pub async fn send_icmp_echo_v4(
     seq: u16,
     tout: Duration,
 ) -> std::io::Result<IcmpEchoReply> {
+    probe_icmp_echo_v4(socket, payload, seq, tout)
+        .await?
+        .into_result()
+}
+
+async fn probe_icmp_echo_v4(
+    socket: &IcmpSocket,
+    payload: &[u8],
+    seq: u16,
+    tout: Duration,
+) -> std::io::Result<ProbeOutcome<IcmpEchoReply>> {
     let sock_type = socket.sock_type();
     let ts_len = time::Timestamp::len();
 
@@ -269,7 +359,7 @@ pub async fn send_icmp_echo_v4(
     buf[2] = (checksum >> 8) as u8;
     buf[3] = (checksum & 0xff) as u8;
 
-    socket.send(&buf).await?;
+    send_request(socket, &buf).await?;
 
     // On header-stripping DGRAM sockets we receive via recvmsg to get TTL from
     // the IP_TTL cmsg. Otherwise (RAW sockets and Apple DGRAM sockets) the IP
@@ -291,10 +381,10 @@ async fn send_icmp_echo_v4_raw(
     sent_ts_bytes: [u8; 8],
     mut buf: Vec<u8>,
     tout: Duration,
-) -> std::io::Result<IcmpEchoReply> {
+) -> std::io::Result<ProbeOutcome<IcmpEchoReply>> {
     let ts_len = time::Timestamp::len();
 
-    let overall = timeout(tout, async {
+    wait_for_reply(tout, async {
         loop {
             buf.clear();
             let received = socket.recv(buf.spare_capacity_mut()).await?;
@@ -338,15 +428,8 @@ async fn send_icmp_echo_v4_raw(
                 rtt,
             });
         }
-    });
-
-    match overall.await {
-        Ok(result) => result,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out",
-        )),
-    }
+    })
+    .await
 }
 
 /// Receive path for header-stripping `SOCK_DGRAM` ping sockets (Linux/Android):
@@ -359,7 +442,7 @@ async fn send_icmp_echo_v4_dgram(
     sent_ts_bytes: [u8; 8],
     mut buf: Vec<u8>,
     tout: Duration,
-) -> std::io::Result<IcmpEchoReply> {
+) -> std::io::Result<ProbeOutcome<IcmpEchoReply>> {
     let ts_len = time::Timestamp::len();
 
     // The kernel delivers the source address in the `msg_name` field and TTL
@@ -370,7 +453,7 @@ async fn send_icmp_echo_v4_dgram(
     let mut control_storage: [MaybeUninit<u64>; 8] = [MaybeUninit::uninit(); 8];
     let mut from: SockAddr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0u16).into();
 
-    let overall = timeout(tout, async {
+    wait_for_reply(tout, async {
         loop {
             buf.clear();
 
@@ -445,15 +528,8 @@ async fn send_icmp_echo_v4_dgram(
                 rtt,
             });
         }
-    });
-
-    match overall.await {
-        Ok(result) => result,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out",
-        )),
-    }
+    })
+    .await
 }
 
 /// Send an ICMPv6 echo request and wait for the matching echo reply.
@@ -476,6 +552,17 @@ pub async fn send_icmp_echo_v6(
     seq: u16,
     tout: Duration,
 ) -> std::io::Result<IcmpV6EchoReply> {
+    probe_icmp_echo_v6(socket, payload, seq, tout)
+        .await?
+        .into_result()
+}
+
+async fn probe_icmp_echo_v6(
+    socket: &IcmpSocket,
+    payload: &[u8],
+    seq: u16,
+    tout: Duration,
+) -> std::io::Result<ProbeOutcome<IcmpV6EchoReply>> {
     let mut buf: Vec<u8> =
         Vec::with_capacity(ICMP_HEADER_SIZE + time::Timestamp::len() + payload.len());
     // On Linux `SOCK_DGRAM` ping sockets, the kernel uses the bound port as
@@ -492,7 +579,7 @@ pub async fn send_icmp_echo_v6(
     buf.extend_from_slice(&sent_ts_bytes);
     buf.extend_from_slice(payload);
 
-    socket.send(&buf).await?;
+    send_request(socket, &buf).await?;
 
     let mut from: SockAddr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0u16, 0, 0).into();
 
@@ -503,7 +590,7 @@ pub async fn send_icmp_echo_v6(
     // a future change adds more cmsgs and overflows it.
     let mut control_storage: [MaybeUninit<u64>; 8] = [MaybeUninit::uninit(); 8];
 
-    let overall = timeout(tout, async {
+    wait_for_reply(tout, async {
         loop {
             buf.clear();
 
@@ -588,15 +675,8 @@ pub async fn send_icmp_echo_v6(
                 rtt,
             });
         }
-    });
-
-    match overall.await {
-        Ok(result) => result,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out",
-        )),
-    }
+    })
+    .await
 }
 
 /// Generate a ping payload
@@ -728,6 +808,180 @@ fn decode_hlim(hdr: &libc::msghdr) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reply_deadline_preserves_public_timeout_behavior() {
+        let outcome = wait_for_reply(
+            Duration::ZERO,
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ProbeOutcome::ReplyTimedOut));
+        let error = outcome.into_result().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(error.raw_os_error(), None);
+    }
+
+    #[tokio::test]
+    async fn reply_deadline_preserves_successful_reply() {
+        let outcome = wait_for_reply(
+            Duration::from_secs(1),
+            std::future::ready(Ok(Duration::from_millis(10))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.into_result().unwrap(), Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn reply_deadline_does_not_swallow_receive_errors() {
+        // An OS-reported TimedOut is an error, not our reply-deadline outcome.
+        for code in [libc::ETIMEDOUT, libc::ECONNREFUSED] {
+            let error = wait_for_reply(
+                Duration::from_secs(1),
+                std::future::ready::<std::io::Result<()>>(Err(std::io::Error::from_raw_os_error(
+                    code,
+                ))),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+
+        let error = wait_for_reply(
+            Duration::from_secs(1),
+            std::future::ready::<std::io::Result<()>>(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid reply metadata",
+            ))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "invalid reply metadata");
+    }
+
+    #[tokio::test]
+    async fn run_probes_counts_replies_and_deadlines_separately() {
+        let mut sequences = Vec::new();
+        let stats = run_probes(3, Duration::ZERO, |seq| {
+            sequences.push(seq);
+            std::future::ready(Ok(match seq {
+                1 => ProbeOutcome::Reply(Duration::from_millis(10)),
+                2 => ProbeOutcome::ReplyTimedOut,
+                3 => ProbeOutcome::Reply(Duration::from_millis(30)),
+                _ => panic!("unexpected probe"),
+            }))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(sequences, [1, 2, 3]);
+        assert_eq!(stats.packets_tx, 3);
+        assert_eq!(stats.packets_rx, 2);
+        assert_eq!(stats.rtt_min, Duration::from_millis(10));
+        assert_eq!(stats.rtt_avg, Duration::from_millis(20));
+        assert_eq!(stats.rtt_max, Duration::from_millis(30));
+        assert_eq!(stats.rtt_std_dev, Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn run_probes_all_deadlines_expire() {
+        let stats = run_probes(3, Duration::ZERO, |_| {
+            wait_for_reply(
+                Duration::ZERO,
+                std::future::pending::<std::io::Result<Duration>>(),
+            )
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(stats.packets_tx, 3);
+        assert_eq!(stats.packets_rx, 0);
+        assert_eq!(stats.rtt_min, Duration::ZERO);
+        assert_eq!(stats.rtt_avg, Duration::ZERO);
+        assert_eq!(stats.rtt_max, Duration::ZERO);
+        assert_eq!(stats.rtt_std_dev, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn run_probes_aborts_on_io_errors_without_partial_statistics() {
+        for code in [libc::EMSGSIZE, libc::ENETUNREACH, libc::ETIMEDOUT] {
+            for fail_at in [1, 3] {
+                let mut calls = 0;
+                let error = run_probes(5, Duration::ZERO, |_| {
+                    calls += 1;
+                    std::future::ready(if calls == fail_at {
+                        Err(std::io::Error::from_raw_os_error(code))
+                    } else if calls == 1 {
+                        Ok(ProbeOutcome::Reply(Duration::from_millis(10)))
+                    } else {
+                        Ok(ProbeOutcome::ReplyTimedOut)
+                    })
+                })
+                .await
+                .unwrap_err();
+
+                assert_eq!(calls, fail_at, "must not send another probe after an error");
+                assert_eq!(error.raw_os_error(), Some(code));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_probes_zero_count_sends_nothing() {
+        let mut calls = 0;
+        let stats = run_probes(0, Duration::ZERO, |_| {
+            calls += 1;
+            std::future::ready(Ok(ProbeOutcome::ReplyTimedOut))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(calls, 0);
+        assert_eq!(stats.packets_tx, 0);
+        assert_eq!(stats.packets_rx, 0);
+        assert_eq!(stats.rtt_avg, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn test_send_icmp_errors_precede_reply_deadlines() {
+        // With no peer, the send fails even when the reply timeout is zero.
+        let v4 = IcmpSocket::bind(Ipv4Addr::LOCALHOST).await.unwrap();
+        let error = send_icmp_echo_v4(&v4, &[], 1, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(error.raw_os_error().is_some());
+
+        let v6 = IcmpSocket::bind(Ipv6Addr::LOCALHOST).await.unwrap();
+        let error = send_icmp_echo_v6(&v6, &[], 1, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(error.raw_os_error().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_send_icmp_ping_propagates_oversized_send_errors() {
+        for host in ["127.0.0.1", "::1"] {
+            let error = ping(host, host, 1, Duration::ZERO, u16::MAX)
+                .await
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EMSGSIZE));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_icmp_ping_loopback_counts() {
+        for host in ["127.0.0.1", "::1"] {
+            let stats = ping(host, host, 3, Duration::ZERO, 64).await.unwrap();
+            assert_eq!(stats.packets_tx, 3);
+            assert_eq!(stats.packets_rx, 3);
+            assert!(stats.rtt_min > Duration::ZERO);
+            assert!(stats.rtt_min <= stats.rtt_avg);
+            assert!(stats.rtt_avg <= stats.rtt_max);
+        }
+    }
 
     #[test]
     fn add_icmp_header_writes_8_bytes() {
