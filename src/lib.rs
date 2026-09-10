@@ -1,15 +1,13 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
-// Pedantic-lint allows scoped to the whole crate. These categories are either
-// unavoidable in protocol code or low-signal for this library:
-// * `doc_markdown` — we'd otherwise have to backtick `ICMPv4`/`ICMPv6` in
-//   every doc comment.
-// * `missing_errors_doc` / `missing_panics_doc` — most public functions wrap
-//   `std::io` and the only `unwrap`s are on length-checked slice conversions
-//   that cannot fail.
-// * `must_use_candidate` — too noisy for small helpers.
-// * The cast lints — packet parsing and stats math intentionally narrow
-//   integer types after explicit range checks.
+// Pedantic-lint allows scoped to the whole crate:
+// * `doc_markdown` - backticking `ICMPv4`/`ICMPv6` in every doc comment
+//   is low-signal.
+// * `missing_errors_doc` / `missing_panics_doc` - most public functions wrap
+//   `std::io` and the only `unwrap`s are on length-checked slice conversions.
+// * `must_use_candidate` - too noisy for small helpers.
+// * The cast lints - packet parsing and stats math narrow integer types
+//   after explicit range checks.
 #![allow(
     clippy::doc_markdown,
     clippy::missing_errors_doc,
@@ -37,8 +35,8 @@ use std::{
     },
     time::Duration,
 };
-// `SocketAddrV4` is only used by the Linux/Android header-stripping DGRAM
-// receive path (`send_icmp_echo_v4_dgram`).
+// `SocketAddrV4` is used only by the Linux/Android header-stripping DGRAM
+// receive path.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::net::SocketAddrV4;
 
@@ -58,8 +56,8 @@ const ICMP_ECHO_REPLY: u8 = 0;
 const ICMP6_ECHO_REQUEST: u8 = 128;
 const ICMP6_ECHO_REPLY: u8 = 129;
 
-/// Both outcomes imply that the complete request was accepted by the socket.
-/// Operational errors, including OS-reported timeouts, remain `Err` values.
+/// `ReplyTimedOut` means the reply deadline expired after a successful send.
+/// All other errors remain `Err` values.
 #[derive(Debug)]
 enum ProbeOutcome<T> {
     Reply(T),
@@ -74,7 +72,7 @@ impl<T> ProbeOutcome<T> {
         }
     }
 
-    /// Preserve the existing public low-level API's timeout representation.
+    /// Convert to the public low-level timeout representation.
     fn into_result(self) -> std::io::Result<T> {
         match self {
             Self::Reply(reply) => Ok(reply),
@@ -98,8 +96,8 @@ async fn send_request(socket: &IcmpSocket, buf: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Called only after a successful send. Only our deadline becomes packet loss;
-/// errors returned by the receive operation are propagated without alteration.
+/// Called after a successful send. A deadline expiry maps to `ReplyTimedOut`;
+/// receive errors propagate unchanged.
 async fn wait_for_reply<T>(
     tout: Duration,
     receive: impl Future<Output = std::io::Result<T>>,
@@ -111,12 +109,7 @@ async fn wait_for_reply<T>(
 }
 
 // Seed `REQ_ID` from PID mixed with the low bits of the current wall-clock
-// time so two processes started with PIDs differing by a multiple of 65536
-// don't begin life with the same id, and so that restarting the same binary
-// quickly doesn't reliably reuse the previous run's ids. The id is only used
-// to disambiguate replies on a shared raw ICMP socket; reply matching also
-// validates `seq` and the echoed timestamp payload, so this seed only needs
-// to spread starting points around the 16-bit space, not be cryptographic.
+// time, spreading starting points around the 16-bit space.
 pub(crate) static REQ_ID: LazyLock<AtomicU16> = LazyLock::new(|| {
     let pid = u64::from(std::process::id());
     let nanos = std::time::SystemTime::now()
@@ -128,13 +121,11 @@ pub(crate) static REQ_ID: LazyLock<AtomicU16> = LazyLock::new(|| {
 
 /// Summary statistics produced by [`ping`].
 ///
-/// Mirrors the output of the Unix `ping` command: packet counts and
-/// round-trip time statistics computed across all replied probes.
+/// Packet counts and round-trip time statistics across all replied probes.
 #[derive(Clone, Copy, Debug)]
 pub struct PingStats {
     /// Number of complete ICMP echo requests accepted by the local socket,
-    /// including requests whose reply deadline expired. This does not imply
-    /// delivery to the destination.
+    /// including requests whose reply deadline expired.
     pub packets_tx: u32,
     /// Number of ICMP echo replies received (i.e. non-timed-out probes).
     pub packets_rx: u32,
@@ -165,31 +156,30 @@ pub struct IcmpEchoReply {
 
 /// Send a series of ICMP echo requests to `dest` and return aggregate statistics.
 ///
-/// Automatically selects ICMPv4 or ICMPv6 based on the resolved address family
-/// of `dest`. The socket is bound to `src` (typically `UNSPECIFIED`) before
-/// connecting.
+/// Selects ICMPv4 or ICMPv6 from the resolved address family of `dest`.
+/// The socket is bound to `src` (typically `UNSPECIFIED`) before connecting.
 /// IPv6 scope (zone) identifiers are preserved end to end.
 ///
 /// # Arguments
 ///
-/// * `src` — Local address to bind the raw socket to (e.g. `Ipv4Addr::UNSPECIFIED`).
-/// * `dest` — Destination host; any type that implements [`ToHostAddr`] is accepted
+/// * `src` - Local address to bind the raw socket to (e.g. `Ipv4Addr::UNSPECIFIED`).
+/// * `dest` - Destination host; any type that implements [`ToHostAddr`] is accepted
 ///   (IP address, scoped IPv6 literal such as `"fe80::1%eth0"`, hostname string, etc.).
-///   Note: [`IpAddr`](std::net::IpAddr) and [`Ipv6Addr`] cannot carry a scope id —
+///   Note: [`IpAddr`](std::net::IpAddr) and [`Ipv6Addr`] cannot carry a scope id -
 ///   use a `&str` or `(Ipv6Addr, u32)` tuple for link-local destinations.
-/// * `count` — Number of ICMP echo requests to send.
-/// * `interval` — How long to wait between sending successive echo requests.
-/// * `size` — Total ICMP payload size in bytes. The first 8 bytes are reserved
+/// * `count` - Number of ICMP echo requests to send.
+/// * `interval` - How long to wait between sending successive echo requests.
+/// * `size` - Total ICMP payload size in bytes. The first 8 bytes are reserved
 ///   for an internal timestamp; must be greater than 8.
 ///
 /// # Errors
 ///
-/// * [`std::io::ErrorKind::InvalidInput`] — `size` is 8 or fewer bytes.
-/// * Any error from address resolution, socket creation, binding, connecting,
-///   sending, or receiving is returned immediately, without partial statistics.
-/// * Only expiration of a probe's reply deadline after a successful send is
-///   counted as packet loss. OS-reported I/O errors are propagated even if
-///   their kind is [`std::io::ErrorKind::TimedOut`].
+/// * [`std::io::ErrorKind::InvalidInput`] - `size` is 8 or fewer bytes.
+/// * Address resolution, socket creation, binding, connecting, sending, or
+///   receiving errors are returned immediately, without partial statistics.
+/// * Expiry of a probe's reply deadline after a successful send is counted
+///   as packet loss. OS-reported I/O errors are propagated even if their kind
+///   is [`std::io::ErrorKind::TimedOut`].
 pub async fn ping<S: ToHostAddr, D: ToHostAddr>(
     src: S,
     dest: D,
@@ -228,8 +218,8 @@ pub async fn ping<S: ToHostAddr, D: ToHostAddr>(
     .await
 }
 
-/// Aggregate completed probes. A successful outcome implies a successful send;
-/// any operational error aborts the run instead of returning partial statistics.
+/// Aggregate completed probes. A reply deadline expiry counts as packet loss;
+/// any other error aborts the run instead of returning partial statistics.
 async fn run_probes<F, Fut>(
     count: u32,
     interval: Duration,
@@ -285,10 +275,10 @@ pub struct IcmpV6EchoReply {
 ///
 /// # Arguments
 ///
-/// * `socket` — A bound and connected [`IcmpSocket`] for IPv4.
-/// * `payload` — Application data appended after the ICMP header and timestamp.
-/// * `seq` — Sequence number embedded in the ICMP echo request.
-/// * `tout` — Maximum time to wait for a matching reply before returning
+/// * `socket` - A bound and connected [`IcmpSocket`] for IPv4.
+/// * `payload` - Application data appended after the ICMP header and timestamp.
+/// * `seq` - Sequence number embedded in the ICMP echo request.
+/// * `tout` - Maximum time to wait for a matching reply before returning
 ///   [`std::io::ErrorKind::TimedOut`].
 ///
 /// # Errors
@@ -315,9 +305,8 @@ async fn probe_icmp_echo_v4(
     let sock_type = socket.sock_type();
     let ts_len = time::Timestamp::len();
 
-    // On Linux `SOCK_DGRAM` ping sockets, the kernel uses the bound port as
-    // the ICMP identifier. We must use the same id in the packet header AND
-    // the bound port. The socket already bound with this id in `bind()`.
+    // On Linux `SOCK_DGRAM` sockets, the request id is the socket's
+    // pre-bound ident when available.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let req_id = match socket.dgram_ident() {
         Some(id) => id,
@@ -326,24 +315,17 @@ async fn probe_icmp_echo_v4(
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let req_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
 
-    // Only Linux/Android ping sockets (`SOCK_DGRAM` + `IPPROTO_ICMP`) strip
-    // the IP header and deliver TTL via an `IP_TTL` control message. On Apple
-    // platforms a `SOCK_DGRAM` ICMP socket still delivers the full IP header,
-    // exactly like a raw socket (Apple's own `ping(8)` parses `struct ip`
-    // even in the datagram case). Treat those like `Raw` for both buffer
-    // sizing and the receive path, otherwise the header-stripped parser reads
-    // the IP version byte as the ICMP type, never matches a reply, and times
-    // out.
+    // On Linux/Android, `SOCK_DGRAM` sockets strip the IP header and deliver
+    // TTL via an `IP_TTL` control message. On other platforms the full IP
+    // header is present, including on Apple `SOCK_DGRAM` sockets.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let dgram_strips_ip_header = true;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let dgram_strips_ip_header = false;
     let use_dgram_recv = sock_type == SocketType::Dgram && dgram_strips_ip_header;
 
-    // Allocate a single buffer used for both send and receive, like the v6
-    // path. When the IP header is present in received data (RAW sockets, and
-    // Apple DGRAM sockets), add that 20-byte overhead so the buffer never
-    // truncates.
+    // Single buffer for send and receive. When received data includes the IP
+    // header (`Raw` sockets and Apple `DGRAM` sockets), add 20 bytes.
     let icmp_len = ICMP_HEADER_SIZE + ts_len + payload.len();
     let buf_cap = if use_dgram_recv {
         icmp_len
@@ -363,10 +345,8 @@ async fn probe_icmp_echo_v4(
 
     send_request(socket, &buf).await?;
 
-    // On header-stripping DGRAM sockets we receive via recvmsg to get TTL from
-    // the IP_TTL cmsg. Otherwise (RAW sockets and Apple DGRAM sockets) the IP
-    // header is present, so we recv and parse it ourselves. The dgram receive
-    // path only exists on Linux/Android, so gate the dispatch accordingly.
+    // On header-stripping DGRAM sockets, receive via recvmsg to read TTL from
+    // the `IP_TTL` cmsg. Otherwise recv and parse the IP header.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if use_dgram_recv {
         return send_icmp_echo_v4_dgram(socket, req_id, seq, sent_ts_bytes, buf, tout).await;
@@ -447,11 +427,9 @@ async fn send_icmp_echo_v4_dgram(
 ) -> std::io::Result<ProbeOutcome<IcmpEchoReply>> {
     let ts_len = time::Timestamp::len();
 
-    // The kernel delivers the source address in the `msg_name` field and TTL
-    // in an `IP_TTL` control message (enabled via `IP_RECVTTL` in `bind()`).
-    // The storage is sized to comfortably exceed `CMSG_SPACE(sizeof(int))`
-    // and is backed by `u64` to satisfy `cmsghdr` alignment; `MSG_CTRUNC` is
-    // checked below in case a future change adds more cmsgs and overflows it.
+    // Source address arrives in `msg_name`; TTL arrives in an `IP_TTL`
+    // control message. Storage exceeds `CMSG_SPACE(sizeof(int))` with `u64`
+    // alignment; `MSG_CTRUNC` is checked below.
     let mut control_storage: [MaybeUninit<u64>; 8] = [MaybeUninit::uninit(); 8];
     let mut from: SockAddr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0u16).into();
 
@@ -514,10 +492,8 @@ async fn send_icmp_echo_v4_dgram(
                     "recvmsg returned no source address",
                 )
             })?;
-            // If the kernel didn't attach an `IP_TTL` cmsg (e.g. an older
-            // kernel that rejected `IP_RECVTTL`), fall back to 0 rather than
-            // dropping the reply. This mirrors iputils `ping(8)`, which only
-            // warns on `setsockopt(IP_RECVTTL)` failure and reports ttl 0.
+            // Without an `IP_TTL` cmsg, fall back to 0 instead of dropping
+            // the reply.
             let reply_ttl = reply_ttl_opt.unwrap_or(0);
             let reply_ts =
                 time::Timestamp::from(<[u8; 8]>::try_from(&buf[ICMP_HEADER_SIZE..ts_end]).unwrap());
@@ -538,10 +514,10 @@ async fn send_icmp_echo_v4_dgram(
 ///
 /// # Arguments
 ///
-/// * `socket` — A bound and connected [`IcmpSocket`] for IPv6.
-/// * `payload` — Application data appended after the ICMPv6 header and timestamp.
-/// * `seq` — Sequence number embedded in the ICMPv6 echo request.
-/// * `tout` — Maximum time to wait for a matching reply before returning
+/// * `socket` - A bound and connected [`IcmpSocket`] for IPv6.
+/// * `payload` - Application data appended after the ICMPv6 header and timestamp.
+/// * `seq` - Sequence number embedded in the ICMPv6 echo request.
+/// * `tout` - Maximum time to wait for a matching reply before returning
 ///   [`std::io::ErrorKind::TimedOut`].
 ///
 /// # Errors
@@ -567,8 +543,8 @@ async fn probe_icmp_echo_v6(
 ) -> std::io::Result<ProbeOutcome<IcmpV6EchoReply>> {
     let mut buf: Vec<u8> =
         Vec::with_capacity(ICMP_HEADER_SIZE + time::Timestamp::len() + payload.len());
-    // On Linux `SOCK_DGRAM` ping sockets, the kernel uses the bound port as
-    // the ICMP identifier. We use the socket's pre-bound ident if available.
+    // On Linux `SOCK_DGRAM` sockets, the request id is the socket's
+    // pre-bound ident when available.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let req_id = match socket.dgram_ident() {
         Some(id) => id,
@@ -585,11 +561,9 @@ async fn probe_icmp_echo_v6(
 
     let mut from: SockAddr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0u16, 0, 0).into();
 
-    // Ancillary data buffer for `IPV6_HOPLIMIT`. Sized to comfortably exceed
-    // `CMSG_SPACE(sizeof(int))` on all supported platforms (~20–24 bytes), and
-    // backed by `u64` so it satisfies the alignment requirements of `cmsghdr`
-    // (which the `CMSG_*` macros assume). MSG_CTRUNC is checked below in case
-    // a future change adds more cmsgs and overflows it.
+    // Ancillary data buffer for `IPV6_HOPLIMIT`. Sized above
+    // `CMSG_SPACE(sizeof(int))` (about 20-24 bytes) with `u64` alignment.
+    // `MSG_CTRUNC` is checked below.
     let mut control_storage: [MaybeUninit<u64>; 8] = [MaybeUninit::uninit(); 8];
 
     wait_for_reply(tout, async {
@@ -597,9 +571,8 @@ async fn probe_icmp_echo_v6(
             buf.clear();
 
             // Receive into `buf` + `control_storage` via a `MsgHdrMut`. The
-            // wrapper is dropped at the end of this inner block so that we
-            // can read from `buf` / `from` / `control_storage` afterwards
-            // without conflicting borrows.
+            // wrapper drops at the end of this block, releasing borrows of
+            // `buf` / `from` / `control_storage`.
             let (received, flags, reply_hlim_opt) = {
                 let bufs = &mut [MaybeUninitSlice::new(buf.spare_capacity_mut())];
                 let control_bytes: &mut [MaybeUninit<u8>] = unsafe {
@@ -622,9 +595,8 @@ async fn probe_icmp_echo_v6(
             };
             unsafe { buf.set_len(received) };
 
-            // If the kernel had to drop ancillary data we can't trust the
-            // hop-limit extraction below, so surface it instead of silently
-            // returning a wrong value.
+            // On truncated ancillary data, return an error rather than a
+            // possibly wrong hop limit.
             if flags & libc::MSG_CTRUNC != 0 {
                 return Err(std::io::Error::other(
                     "recvmsg control buffer truncated (MSG_CTRUNC)",
@@ -646,9 +618,7 @@ async fn probe_icmp_echo_v6(
             if reply_seq != seq {
                 continue;
             }
-            // Validate the echoed timestamp matches what we sent. This is the
-            // strongest filter against another raw-ICMP user on this host
-            // happening to use the same id while pinging the same peer.
+            // The echoed timestamp must match the sent timestamp.
             let ts_end = ICMP_HEADER_SIZE + time::Timestamp::len();
             if buf[ICMP_HEADER_SIZE..ts_end] != sent_ts_bytes {
                 continue;
@@ -736,12 +706,9 @@ fn calculate_checksum(data: &[u8]) -> u16 {
     }
 }
 
-/// Extract the `IP_TTL` ancillary value from a received message on a
-/// `SOCK_DGRAM` (ping) socket.
+/// Extract the `IP_TTL` ancillary value from a received message.
 ///
-/// When using ping sockets on Linux, the kernel delivers TTL via the
-/// `IP_TTL` control message instead of in the IP header (which is stripped).
-/// Returns `None` if no matching cmsg was present or the value did not fit
+/// Returns `None` when no matching cmsg is present or the value does not fit
 /// in a `u8`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn decode_ip_ttl(hdr: &libc::msghdr) -> Option<u8> {
@@ -774,11 +741,8 @@ fn decode_ip_ttl(hdr: &libc::msghdr) -> Option<u8> {
 
 /// Extract the `IPV6_HOPLIMIT` ancillary value from a received message.
 ///
-/// Walks the control-message chain attached to `hdr` using `CMSG_FIRSTHDR` /
-/// `CMSG_NXTHDR`, which is the only portable way to interpret a `recvmsg(2)`
-/// control buffer (it handles per-platform alignment and padding via the
-/// kernel-provided macros). Returns `None` if no matching cmsg was present
-/// or the value did not fit in a `u8`.
+/// Returns `None` when no matching cmsg is present or the value does not fit
+/// in a `u8`.
 fn decode_hlim(hdr: &libc::msghdr) -> Option<u8> {
     // SAFETY: `hdr` is a valid `*const msghdr` whose `msg_control` /
     // `msg_controllen` were written by the kernel during `recvmsg`. The
@@ -838,7 +802,6 @@ mod tests {
 
     #[tokio::test]
     async fn reply_deadline_does_not_swallow_receive_errors() {
-        // An OS-reported TimedOut is an error, not our reply-deadline outcome.
         for code in [libc::ETIMEDOUT, libc::ECONNREFUSED] {
             let error = wait_for_reply(
                 Duration::from_secs(1),

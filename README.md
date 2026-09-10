@@ -149,7 +149,7 @@ The reported byte count (`1508`) is ICMP header (8) + payload (`size`).
 This crate picks the least-privileged socket type available on each platform,
 so in the common case **no elevated privileges are required**.
 
-**Linux** — an unprivileged ICMP datagram socket (`SOCK_DGRAM` +
+**Linux** - an unprivileged ICMP datagram socket (`SOCK_DGRAM` +
 `IPPROTO_ICMP`/`IPPROTO_ICMPV6`) is tried first. This works out of the box as
 long as your group id is within the kernel's `net.ipv4.ping_group_range`
 sysctl (on most distributions this already covers all users):
@@ -172,11 +172,11 @@ sudo setcap cap_net_raw+ep target/release/ping
 
 Or simply run with `sudo`.
 
-**macOS** — an unprivileged ICMP datagram socket is used automatically when
+**macOS** - an unprivileged ICMP datagram socket is used automatically when
 not running as root (matching the system `ping(8)` / `ping6(8)`), so no
 special setup is needed. Running as root uses a raw socket.
 
-**Other BSDs / Unix** — raw sockets are used, which require running as root or
+**Other BSDs / Unix** - raw sockets are used, which require running as root or
 `sudo`.
 
 ---
@@ -186,7 +186,7 @@ special setup is needed. Running as root uses a raw socket.
 CI exercises the crate on **Linux** and **macOS**. Most Unix-like platforms
 that provide POSIX raw sockets and the `recvmsg` / `cmsghdr` ancillary-data
 APIs (the BSDs, illumos, etc.) are expected to work, though they are not
-covered by automated tests. **Windows is not supported** — the implementation
+covered by automated tests. **Windows is not supported** - the implementation
 relies on POSIX socket semantics (`AsyncFd`, `IPV6_RECVHOPLIMIT`, `CMSG_*`)
 that have no direct Windows equivalent.
 
@@ -196,14 +196,12 @@ that have no direct Windows equivalent.
 
 This implementation derives from BSD `ping`, originally written by Mike Muuss in 1983, and follows several of its design choices:
 
-- **Embedded timestamps.** The send time is written into the first 8 bytes of the echo payload and read back from the reply. This avoids maintaining a hashtable (or similar side data) keyed on sequence number to compute RTT — the timing information travels with the packet itself.
+- **Embedded timestamps.** The send time is written into the first 8 bytes of the echo payload and read back from the reply. The timing information travels with the packet itself.
 - **Unprivileged ICMP sockets with a raw-socket fallback.** On Linux and
   macOS the crate first opens an unprivileged ICMP datagram socket
-  (`SOCK_DGRAM` + `IPPROTO_ICMP`/`IPPROTO_ICMPV6`) so it can run without
-  `CAP_NET_RAW` or root. If the kernel denies it (e.g. the group is outside
-  `net.ipv4.ping_group_range`, or on other Unix platforms), it transparently
-  falls back to a raw socket (`SOCK_RAW`). This mirrors the strategy used by
-  iputils `ping(8)`.
+  (`SOCK_DGRAM` + `IPPROTO_ICMP`/`IPPROTO_ICMPV6`). If the kernel denies it
+  (e.g. the group is outside `net.ipv4.ping_group_range`, or on other Unix
+  platforms), it falls back to a raw socket (`SOCK_RAW`).
 - **Datagram vs. raw receive paths.** On a raw socket the kernel delivers the
   full IP packet and the reply TTL is read from the IP header. On a datagram
   ping socket the IP header is stripped, so the TTL is recovered from an
@@ -211,7 +209,7 @@ This implementation derives from BSD `ping`, originally written by Mike Muuss in
   also derives the ICMP echo identifier from the socket's bound port on
   datagram sockets, so the crate binds a unique port per socket and matches
   replies against it.
-- **IPv6 hop limit exposure.** For IPv6 the received hop limit is not present in the ICMPv6 payload, so the socket is configured with `IPV6_RECVHOPLIMIT` and the value is recovered from the `recvmsg` ancillary data (`cmsghdr` / `CMSG_*`). This mirrors `ping6` and surfaces a TTL-equivalent field for network diagnostics.
+- **IPv6 hop limit exposure.** For IPv6 the received hop limit is not present in the ICMPv6 payload, so the socket is configured with `IPV6_RECVHOPLIMIT` and the value is recovered from the `recvmsg` ancillary data (`cmsghdr` / `CMSG_*`).
 
 ---
 

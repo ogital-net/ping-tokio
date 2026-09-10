@@ -11,9 +11,8 @@ pub(crate) struct RttStats {
 
 /// Compute population statistics; empty input produces zero durations.
 ///
-/// The mean is truncated to whole nanoseconds.
-/// Standard deviation is computed in floating-point seconds and rounded to
-/// the nearest nanosecond when converted back to a duration.
+/// The mean is truncated to whole nanoseconds. Standard deviation is computed
+/// in floating-point seconds and rounded to the nearest nanosecond.
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 pub(crate) fn compute_rtt_stats(rtts: &[Duration]) -> RttStats {
     if rtts.is_empty() {
@@ -24,24 +23,20 @@ pub(crate) fn compute_rtt_stats(rtts: &[Duration]) -> RttStats {
     let max = *rtts.iter().max().unwrap();
     let count = rtts.len() as u128;
 
-    // Divide before summing so even Duration::MAX samples cannot overflow.
-    // The quotient sum is bounded by the largest sample's nanosecond count.
-    // Each remainder is < count, so their sum fits in u128 on 32/64-bit targets.
+    // Quotient/remainder sums keep the mean within the input range.
     let (quotients, remainders) = rtts.iter().fold((0u128, 0u128), |(q, r), sample| {
         let nanos = sample.as_nanos();
         (q + nanos / count, r + nanos % count)
     });
     let avg_nanos = quotients + remainders / count;
-    // The mean is within the input range, so both components fit these types.
     let avg = Duration::new(
         (avg_nanos / 1_000_000_000) as u64,
         (avg_nanos % 1_000_000_000) as u32,
     );
     let fractional_mean_secs = (remainders % count) as f64 / count as f64 * 1e-9;
 
-    // Center on the exact mean instead of subtracting two large floats. This
-    // preserves nanosecond differences even between very large durations.
-    // Include the fractional nanosecond omitted from the reported mean.
+    // Deviations are centered on the exact mean, including the fractional
+    // nanosecond omitted from the reported mean.
     let mut squared_sum = 0.0;
     let mut compensation = 0.0;
     for &sample in rtts {
@@ -50,16 +45,13 @@ pub(crate) fn compute_rtt_stats(rtts: &[Duration]) -> RttStats {
         } else {
             -(avg - sample).as_secs_f64() - fractional_mean_secs
         };
-        // Kahan summation limits rounding loss across many squared deviations.
+        // Kahan summation.
         let term = delta * delta - compensation;
         let next_sum = squared_sum + term;
         compensation = (next_sum - squared_sum) - term;
         squared_sum = next_sum;
     }
 
-    // Even Duration::MAX squared and summed over a slice fits in f64. The
-    // population standard deviation is at most half the input range, so the
-    // resulting duration is representable, including at the upper boundary.
     let std_dev = Duration::from_secs_f64((squared_sum / count as f64).sqrt());
     RttStats {
         rtt_min: min,
@@ -104,8 +96,7 @@ mod tests {
 
     #[test]
     fn realistic_samples_match_an_exact_integer_reference() {
-        // Fixed-seed samples make this deterministic and independent of the
-        // floating-point algorithm. These bounds keep the u128 oracle exact.
+        // Fixed-seed samples; bounds keep the u128 oracle exact.
         let mut seed = 1u64;
         for count in [1usize, 2, 3, 10, 100, 1000] {
             let rtts: Vec<_> = (0..count)
@@ -138,7 +129,7 @@ mod tests {
 
     #[test]
     fn large_sample_sum_does_not_overflow() {
-        // Each sample fits in u64 nanoseconds, but their sum does not.
+        // Sample fits in u64 nanoseconds; the sum does not.
         let sample = Duration::from_secs(10_000_000_000);
         let stats = compute_rtt_stats(&[sample; 4]);
         assert_eq!(stats.rtt_avg, sample);
@@ -147,8 +138,7 @@ mod tests {
 
     #[test]
     fn large_durations_retain_nanosecond_differences() {
-        // Larger than u64 nanoseconds; converting the samples themselves to
-        // f64 seconds would also erase the two-nanosecond difference.
+        // Larger than u64 nanoseconds.
         let base = Duration::from_secs(20_000_000_000);
         let stats = compute_rtt_stats(&[base, base + Duration::from_nanos(2)]);
         assert_eq!(stats.rtt_min, base);
