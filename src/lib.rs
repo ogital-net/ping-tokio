@@ -189,7 +189,8 @@ pub async fn ping<S: ToHostAddr, D: ToHostAddr>(
     interval: Duration,
     size: u16,
 ) -> std::io::Result<PingStats> {
-    let dest = dest.to_host_addr().await?;
+    // Validate before resolving: an invalid `size` must fail with
+    // `InvalidInput` without paying for a DNS lookup.
     let ts_len = time::Timestamp::len();
     if (size as usize) <= ts_len {
         return Err(std::io::Error::new(
@@ -197,6 +198,7 @@ pub async fn ping<S: ToHostAddr, D: ToHostAddr>(
             format!("size must be greater than {ts_len} (timestamp bytes)"),
         ));
     }
+    let dest = dest.to_host_addr().await?;
     let payload = generate_payload(size as usize - ts_len);
     let tout = Duration::from_secs(5);
 
@@ -746,7 +748,7 @@ fn decode_ip_ttl(hdr: &libc::msghdr) -> Option<u8> {
     // SAFETY: `hdr` is a valid `*const msghdr` whose `msg_control` /
     // `msg_controllen` were written by the kernel during `recvmsg`. The
     // `CMSG_*` macros expect exactly this.
-    let want_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) } as usize;
+    let want_len = unsafe { libc::CMSG_LEN(size_of::<libc::c_int>() as u32) } as usize;
     let mut p = unsafe { libc::CMSG_FIRSTHDR(hdr) };
     while !p.is_null() {
         let h = unsafe { &*p };
@@ -759,7 +761,7 @@ fn decode_ip_ttl(hdr: &libc::msghdr) -> Option<u8> {
                 std::ptr::copy_nonoverlapping(
                     libc::CMSG_DATA(p),
                     value.as_mut_ptr().cast::<u8>(),
-                    std::mem::size_of::<libc::c_int>(),
+                    size_of::<libc::c_int>(),
                 );
                 value.assume_init()
             };
@@ -939,6 +941,22 @@ mod tests {
         assert_eq!(stats.packets_tx, 0);
         assert_eq!(stats.packets_rx, 0);
         assert_eq!(stats.rtt_avg, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn ping_invalid_size_precedes_resolution() {
+        // An unresolvable destination must not mask the `InvalidInput`
+        // error: `size` is validated before any DNS lookup.
+        let error = ping(
+            Ipv4Addr::UNSPECIFIED,
+            "nonexistent.invalid",
+            1,
+            Duration::ZERO,
+            8,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     /// Build a full IPv4 packet wrapping an ICMP echo reply whose payload
