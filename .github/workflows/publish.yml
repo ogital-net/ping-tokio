@@ -29,10 +29,14 @@ jobs:
             exit 1
           fi
 
+      - name: Allow unprivileged ICMP (Linux)
+        # The crate opens ICMP datagram (ping) sockets, which require the
+        # caller's group to be within net.ipv4.ping_group_range. Widen it,
+        # matching the CI workflow.
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+
       - name: Run tests (all features)
-        # Tests that open raw ICMP sockets need CAP_NET_RAW, which we don't
-        # have in CI. Skip them here, matching the CI workflow.
-        run: cargo test --all-features --lib --bins --verbose -- --skip net::tests --skip test_send_icmp
+        run: cargo test --all-features --lib --bins --verbose
 
       - name: Run doc tests
         run: cargo test --doc --all-features
