@@ -83,3 +83,5 @@ jobs:
         run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
       - name: test (full suite — unprivileged ping sockets)
         run: cargo test --all-features --lib --bins
+      - name: doc tests (compile-only examples from README / rustdoc)
+        run: cargo test --all-features --doc
