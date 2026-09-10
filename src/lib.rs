@@ -417,7 +417,11 @@ async fn send_icmp_echo_v4_raw(
 /// that delivers the IP header (`SOCK_RAW`, or Apple `SOCK_DGRAM`).
 ///
 /// The IP header length is taken from the IHL field, so replies carrying IP
-/// options are matched correctly. Returns `None` for packets that are not a
+/// options are matched correctly. The total-length field is deliberately not
+/// consulted: BSD-derived kernels deliver `ip_len` in host byte order, and
+/// Apple `SOCK_DGRAM` ping sockets deliver an `ip_len` that does not cover
+/// the IP header, so the received datagram length bounds the ICMP message
+/// instead (as ping(8) does). Returns `None` for packets that are not a
 /// well-formed IPv4 echo reply matching `req_id` / `seq` / `sent_ts_bytes`.
 fn parse_ipv4_reply(
     packet: &[u8],
@@ -439,17 +443,11 @@ fn parse_ipv4_reply(
         return None;
     }
 
-    // The IP total-length field bounds the packet; any excess bytes in the
-    // receive buffer (e.g. link-layer padding) are ignored.
-    let total_len = usize::from(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]));
-    if total_len < ip_header_len || packet.len() < total_len {
-        return None;
-    }
-    let icmp_len = total_len - ip_header_len;
+    let icmp_len = packet.len().checked_sub(ip_header_len)?;
     if icmp_len < ICMP_HEADER_SIZE + ts_len {
         return None;
     }
-    let icmp = &packet[ip_header_len..total_len];
+    let icmp = &packet[ip_header_len..];
 
     if icmp[0] != ICMP_ECHO_REPLY {
         return None;
@@ -1094,11 +1092,6 @@ mod tests {
         // IHL larger than the received datagram.
         let mut packet = ipv4_echo_reply_packet(6, 0x01, 0x1234, 7, ts, &[]);
         packet.truncate(packet.len() - 4);
-        assert!(parse_ipv4_reply(&packet, 0x1234, 7, ts).is_none());
-
-        // Total length smaller than the IP header.
-        let mut packet = ipv4_echo_reply_packet(5, 0, 0x1234, 7, ts, &[]);
-        packet[2..4].copy_from_slice(&19u16.to_be_bytes());
         assert!(parse_ipv4_reply(&packet, 0x1234, 7, ts).is_none());
 
         // Truncated ICMP message (timestamp does not fit).
