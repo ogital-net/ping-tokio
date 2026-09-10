@@ -41,7 +41,9 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
-`ping` accepts any type that implements `ToIpAddr` for both `src` and `dest`: `Ipv4Addr`, `Ipv6Addr`, `IpAddr`, `&str`, or `String`.
+`ping` accepts any type that implements `ToHostAddr` for both `src` and `dest`: `HostAddr`, `Ipv4Addr`, `Ipv6Addr`, `IpAddr`, `(Ipv6Addr, u32)`, `&str`, or `String`.
+
+IPv6 scope (zone) identifiers are preserved end to end via `HostAddr`. Link-local destinations such as `"fe80::1%eth0"` resolve, bind, and connect using that interface's scope id. Note that `IpAddr` and `Ipv6Addr` cannot represent a scope id - use a scoped `&str` (`"fe80::1%eth0"`) or an `(Ipv6Addr, u32)` tuple for link-local addresses.
 
 The `size` parameter is the total ICMP payload size in bytes. The first 8 bytes of the payload are reserved for an internal timestamp used to measure RTT; `size` must therefore be greater than 8.
 

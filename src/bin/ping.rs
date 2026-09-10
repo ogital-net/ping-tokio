@@ -1,9 +1,11 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{Ipv4Addr, Ipv6Addr},
     time::Duration,
 };
 
-use ping_tokio::{generate_payload, send_icmp_echo_v4, send_icmp_echo_v6, IcmpSocket};
+use ping_tokio::{
+    generate_payload, send_icmp_echo_v4, send_icmp_echo_v6, HostAddr, IcmpSocket, ToHostAddr,
+};
 
 // Share the implementation without adding a public statistics API to the library.
 #[path = "../stats.rs"]
@@ -88,17 +90,9 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-async fn resolve(dest: &str) -> std::io::Result<IpAddr> {
-    if let Ok(ip) = dest.parse::<IpAddr>() {
-        return Ok(ip);
-    }
-    let addrs: Vec<_> = tokio::net::lookup_host(format!("{dest}:0"))
-        .await?
-        .collect();
-    addrs
-        .first()
-        .map(|a| a.ip())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address found"))
+/// Resolve `dest` to a [`HostAddr`], preserving any IPv6 scope (zone) id.
+async fn resolve(dest: &str) -> std::io::Result<HostAddr> {
+    dest.to_host_addr().await
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -118,31 +112,31 @@ async fn main() {
 }
 
 async fn run(args: Args) -> std::io::Result<()> {
-    let dest_ip = resolve(&args.dest_str).await?;
+    let dest = resolve(&args.dest_str).await?;
 
     // "data bytes" in the header is the total ICMP payload size (our `size` parameter).
     println!(
         "PING {} ({}): {} data bytes",
-        args.dest_str, dest_ip, args.size
+        args.dest_str, dest, args.size
     );
 
     let payload = generate_payload(args.size as usize - 8);
 
-    let socket = match dest_ip {
-        IpAddr::V4(_) => IcmpSocket::bind(Ipv4Addr::UNSPECIFIED).await?,
-        IpAddr::V6(_) => IcmpSocket::bind(Ipv6Addr::UNSPECIFIED).await?,
+    let socket = match dest {
+        HostAddr::V4(_) => IcmpSocket::bind(Ipv4Addr::UNSPECIFIED).await?,
+        HostAddr::V6 { .. } => IcmpSocket::bind(Ipv6Addr::UNSPECIFIED).await?,
     };
-    socket.connect(dest_ip.to_string().as_str()).await?;
+    socket.connect(dest).await?;
 
     let mut packets_rx: u32 = 0;
     let mut rtts: Vec<Duration> = Vec::with_capacity(args.count as usize);
 
     for seq in 0..args.count {
-        let result = match dest_ip {
-            IpAddr::V4(_) => send_icmp_echo_v4(&socket, &payload, seq as u16, args.timeout)
+        let result = match dest {
+            HostAddr::V4(_) => send_icmp_echo_v4(&socket, &payload, seq as u16, args.timeout)
                 .await
                 .map(|r| (r.len, r.src_addr.to_string(), r.seq, r.ttl as u32, r.rtt)),
-            IpAddr::V6(_) => send_icmp_echo_v6(&socket, &payload, seq as u16, args.timeout)
+            HostAddr::V6 { .. } => send_icmp_echo_v6(&socket, &payload, seq as u16, args.timeout)
                 .await
                 .map(|r| (r.len, r.src_addr.to_string(), r.seq, r.hlim as u32, r.rtt)),
         };

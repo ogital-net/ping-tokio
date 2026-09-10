@@ -6,7 +6,7 @@ use socket2::{Domain, MsgHdrMut, Protocol, Socket, Type};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::io::Interest;
 
-use crate::addr::ToIpAddr;
+use crate::addr::{HostAddr, ToHostAddr};
 
 /// Whether the ICMP socket was created via `SOCK_DGRAM` or `SOCK_RAW`.
 ///
@@ -30,17 +30,13 @@ struct NewSocket {
 
 /// Create a socket suitable for ICMP communication.
 ///
-/// On **Linux**, tries `SOCK_DGRAM` (ping socket) first. If that fails with
-/// `EACCES` (user not in `net.ipv4.ping_group_range`), `EAFNOSUPPORT`, or
-/// `EPROTONOSUPPORT`, falls back to `SOCK_RAW`. This mirrors the strategy
-/// used by iputils `ping(8)`.
+/// On Linux, tries `SOCK_DGRAM` first and falls back to `SOCK_RAW` on
+/// `EACCES`, `EAFNOSUPPORT`, or `EPROTONOSUPPORT`.
 ///
-/// On **Apple platforms**, uses `SOCK_DGRAM` when running without root
-/// privileges and `SOCK_RAW` when running as root — matching macOS
-/// `ping(8)` and `ping6(8)`. `SOCK_DGRAM` with `IPPROTO_ICMP`/`IPPROTO_ICMPV6`
-/// works for all users on macOS.
+/// On Apple platforms, uses `SOCK_DGRAM` when not running as root and
+/// `SOCK_RAW` when running as root.
 ///
-/// On all other platforms, `SOCK_RAW` is used unconditionally.
+/// On all other platforms, `SOCK_RAW` is used.
 fn new_icmp_socket(domain: Domain, protocol: Protocol) -> std::io::Result<NewSocket> {
     #[cfg(any(target_os = "linux", target_os = "android",))]
     {
@@ -118,31 +114,21 @@ fn is_root() -> bool {
 ///
 /// # Platform-specific privileges
 ///
-/// Creating an `IcmpSocket` for ICMP typically requires elevated privileges:
-///
 /// | Platform | ICMPv4 | ICMPv6 |
 /// |---|---|---|
 /// | **macOS** | No privileges needed (`SOCK_DGRAM`) | No privileges needed (`SOCK_DGRAM`) |
 /// | **Linux** | `net.ipv4.ping_group_range` or `CAP_NET_RAW` | Same |
 /// | **FreeBSD** / **NetBSD** / **OpenBSD** | Root | Root |
 ///
-/// On **Apple platforms**, this library automatically uses a datagram
-/// (`SOCK_DGRAM`) socket when not running as root — the same approach used
-/// by macOS `ping(8)` and `ping6(8)`. When running as root, `SOCK_RAW` is
-/// used.
+/// On Apple platforms, a datagram (`SOCK_DGRAM`) socket is used when not
+/// running as root; `SOCK_RAW` is used when running as root.
 ///
-/// On **Linux**, a `SOCK_DGRAM` (ping) socket is tried first. If the user's
-/// group is not in the kernel's `net.ipv4.ping_group_range` sysctl, the
-/// kernel returns `EACCES` and the library falls back to `SOCK_RAW` (which
-/// requires `CAP_NET_RAW`). This mirrors the strategy used by iputils
-/// `ping(8)`.
+/// On Linux, a `SOCK_DGRAM` socket is tried first with fallback to `SOCK_RAW`.
 pub struct IcmpSocket {
     io: AsyncFd<Socket>,
     sock_type: SocketType,
-    /// On `SOCK_DGRAM` (ping) sockets on Linux, the kernel uses the bound
-    /// port as the ICMP echo identifier. This field stores that port so the
-    /// receive path can check it. `None` on `SOCK_RAW` sockets where the
-    /// identifier is written directly into the ICMP packet header.
+    /// Identifier from the bound port on Linux `SOCK_DGRAM` sockets.
+    /// `None` on `SOCK_RAW` sockets.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     dgram_ident: Option<u16>,
 }
@@ -153,47 +139,28 @@ impl IcmpSocket {
     /// The address family of `addr` (after resolution) determines whether an
     /// ICMPv4 or ICMPv6 socket is created. The socket is placed in
     /// non-blocking mode and registered with the current Tokio runtime.
+    /// The resolved IPv6 scope (zone) id is used for bind.
     ///
-    /// On **Apple platforms** when not running as root, uses `SOCK_DGRAM` for
-    /// both ICMPv4 and ICMPv6 (matching macOS `ping(8)` / `ping6(8)`).
-    /// When running as root, `SOCK_RAW` is used.
+    /// On Apple platforms, `SOCK_DGRAM` is used when not running as root and
+    /// `SOCK_RAW` when running as root.
     ///
-    /// On **Linux**, a `SOCK_DGRAM` (ping) socket is tried first, with
-    /// automatic fallback to `SOCK_RAW` if the kernel denies the ping socket
-    /// (e.g. the user is not in `net.ipv4.ping_group_range`).
-    pub async fn bind<A: ToIpAddr>(addr: A) -> std::io::Result<IcmpSocket> {
-        let ip_addr = addr.to_ip_addr().await?;
-        let (domain, protocol) = match ip_addr {
-            std::net::IpAddr::V4(_) => (Domain::IPV4, Protocol::ICMPV4),
-            std::net::IpAddr::V6(_) => (Domain::IPV6, Protocol::ICMPV6),
+    /// On Linux, a `SOCK_DGRAM` socket is tried first with fallback to
+    /// `SOCK_RAW`.
+    pub async fn bind<A: ToHostAddr>(addr: A) -> std::io::Result<IcmpSocket> {
+        let host = addr.to_host_addr().await?;
+        let (domain, protocol) = match host {
+            HostAddr::V4(_) => (Domain::IPV4, Protocol::ICMPV4),
+            HostAddr::V6 { .. } => (Domain::IPV6, Protocol::ICMPV6),
         };
         let NewSocket { socket, sock_type } = new_icmp_socket(domain, protocol)?;
         socket.set_nonblocking(true)?;
 
-        // On `SOCK_DGRAM` ping sockets on Linux, the kernel uses the bound
-        // port as the ICMP echo identifier — the id field in the packet
-        // header is ignored. We must bind with a specific non-zero port
-        // so we can recognise our own replies. This mirrors iputils ping's
-        // `sin_port = rts->ident` / `sin6_port = rts->ident` logic in
-        // `ping4_run()` / `ping6_run()`.
-        //
-        // On Apple platforms, the kernel correctly uses the packet's id
-        // field, so the port doesn't matter — we keep port 0 and rely on
-        // the `req_id` written into the ICMP header by the caller.
-        //
-        // We use the same `REQ_ID` counter that `send_icmp_echo_v4` /
-        // `send_icmp_echo_v6` will write into the packet header, keeping
-        // the two in sync.
+        // Bind port for Linux `SOCK_DGRAM` sockets; 0 elsewhere.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let dgram_ident = if sock_type == SocketType::Dgram {
             use std::sync::atomic::Ordering;
-            // SAFETY: `REQ_ID` is a global lazily-initialized atomic; safe to
-            // access from any async context. The counter wraps naturally at 2^16.
-            //
-            // Skip id 0: the kernel interprets a bind port of 0 as "pick a
-            // random port", which defeats the purpose. We fetch the next
-            // value rather than mapping 0 -> 1 so we don't bias id 1 (which
-            // would otherwise be produced both naturally and by remapping).
+            // SAFETY: `REQ_ID` is a global atomic; safe from any async context.
+            // Skip id 0.
             let ident = loop {
                 let candidate = crate::REQ_ID.fetch_add(1, Ordering::Relaxed);
                 if candidate != 0 {
@@ -205,12 +172,7 @@ impl IcmpSocket {
             None
         };
 
-        // On non-Linux platforms, DGRAM sockets use the packet's id field
-        // for matching, not the port.
-        //
-        // On datagram (ping) sockets on Linux, request TTL via ancillary data
-        // since the kernel strips the IP header. On macOS DGRAM sockets this
-        // is a no-op (harmless setsockopt that returns an error we ignore).
+        // Request IPv4 TTL via ancillary data on `SOCK_DGRAM` sockets.
         if sock_type == SocketType::Dgram && domain == Domain::IPV4 {
             let hold: libc::c_int = 1;
             let _ = unsafe {
@@ -227,13 +189,8 @@ impl IcmpSocket {
         if domain == Domain::IPV6 {
             socket.set_recv_hoplimit_v6(true)?;
         }
-        // `IP_DONTFRAG` / `IPV6_DONTFRAG`. On Apple platforms, `IP_DONTFRAG`
-        // works on an unprivileged `SOCK_DGRAM` ICMPv4 socket — macOS `ping(8)`
-        // likewise sets `IP_DONTFRAG` in its non-root path. Empirically,
-        // `IPV6_DONTFRAG` returns an error on an unprivileged `SOCK_DGRAM`
-        // ICMPv6 socket on macOS, so we skip it there. (Note: macOS `ping6(8)`
-        // itself applies `IPV6_DONTFRAG` unconditionally; this skip is our own
-        // workaround for the DGRAM-socket limitation, not a mirror of ping6.)
+        // Set `IP_DONTFRAG` / `IPV6_DONTFRAG`, except IPv6 on Apple
+        // platforms when not running as root.
         let skip_dontfrag = {
             #[cfg(any(
                 target_os = "macos",
@@ -260,22 +217,19 @@ impl IcmpSocket {
             set_dont_fragment(&socket, domain, true)?;
         }
 
-        // Build the bind address. On Linux `SOCK_DGRAM` ping sockets the port
-        // carries the ICMP identifier (see `dgram_ident` above); everywhere
-        // else the port is 0 and the identifier lives in the packet header.
+        // Bind address with the DGRAM ident as port on Linux, else port 0.
+        // The resolved IPv6 scope id is preserved.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let bind_port = dgram_ident.unwrap_or(0);
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let bind_port = 0u16;
-        let sock_addr = match ip_addr {
-            std::net::IpAddr::V4(ipv4_addr) => {
-                SocketAddr::V4(SocketAddrV4::new(ipv4_addr, bind_port))
-            }
-            std::net::IpAddr::V6(ipv6_addr) => {
-                SocketAddr::V6(SocketAddrV6::new(ipv6_addr, bind_port, 0, 0))
+        let bind_addr = match host {
+            HostAddr::V4(ip) => SocketAddr::V4(SocketAddrV4::new(ip, bind_port)),
+            HostAddr::V6 { ip, scope_id } => {
+                SocketAddr::V6(SocketAddrV6::new(ip, bind_port, 0, scope_id))
             }
         };
-        socket.bind(&sock_addr.into())?;
+        socket.bind(&bind_addr.into())?;
         let io = AsyncFd::new(socket)?;
         Ok(Self {
             io,
@@ -285,33 +239,26 @@ impl IcmpSocket {
         })
     }
 
-    /// Connect this socket to `addr` so that subsequent `send`/`recv` calls
-    /// communicate with that peer only.
-    pub async fn connect<A: ToIpAddr>(&self, addr: A) -> std::io::Result<()> {
-        let ip_addr = addr.to_ip_addr().await?;
-        let socket_addr = match ip_addr {
-            std::net::IpAddr::V4(ipv4_addr) => SocketAddr::V4(SocketAddrV4::new(ipv4_addr, 0u16)),
-            std::net::IpAddr::V6(ipv6_addr) => {
-                SocketAddr::V6(SocketAddrV6::new(ipv6_addr, 0u16, 0, 0))
-            }
+    /// Connect this socket to `addr`.
+    ///
+    /// The IPv6 scope (zone) id is preserved. The connect port is always `0`.
+    pub async fn connect<A: ToHostAddr>(&self, addr: A) -> std::io::Result<()> {
+        let host = addr.to_host_addr().await?;
+        let socket_addr = match host {
+            HostAddr::V4(ip) => SocketAddr::V4(SocketAddrV4::new(ip, 0)),
+            HostAddr::V6 { ip, scope_id } => SocketAddr::V6(SocketAddrV6::new(ip, 0, 0, scope_id)),
         };
         self.io.get_ref().connect(&socket_addr.into())
     }
 
     /// Returns the socket type (`Raw` or `Dgram`) used for this ICMP socket.
-    ///
-    /// When `Dgram`, the receive path must skip IP-header parsing and retrieve
-    /// TTL/hop-limit from ancillary data instead.
     pub(crate) fn sock_type(&self) -> SocketType {
         self.sock_type
     }
 
-    /// Returns the ICMP identifier bound to this socket's datagram port.
+    /// Returns the bound datagram port identifier on Linux.
     ///
-    /// On Linux `SOCK_DGRAM` ping sockets, the kernel derives the ICMP echo
-    /// identifier from the bound port, ignoring the id field in the packet
-    /// header. This returns that port (ident). On `SOCK_RAW` sockets, returns
-    /// `None`.
+    /// Returns `None` on `SOCK_RAW` sockets.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn dgram_ident(&self) -> Option<u16> {
         self.dgram_ident
@@ -416,9 +363,6 @@ fn set_dont_fragment(socket: &Socket, domain: Domain, dont_fragment: bool) -> st
     }
 }
 
-// `payload` is taken by value so we can take its address with `&raw const`
-// for `setsockopt`; the caller's value would otherwise need to outlive the
-// call. The borrow lint doesn't model this.
 #[allow(clippy::needless_pass_by_value)]
 unsafe fn setsockopt<T>(
     socket: &Socket,
@@ -448,6 +392,21 @@ mod tests {
 
     use super::IcmpSocket;
 
+    /// Loopback interface name: `lo` on Linux/Android, `lo0` elsewhere.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const LOOPBACK: &str = "lo";
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const LOOPBACK: &str = "lo0";
+
+    /// Scope (zone) id of the loopback interface on this host.
+    fn loopback_scope_id() -> u32 {
+        let name = std::ffi::CString::new(LOOPBACK).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated C string.
+        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        assert_ne!(index, 0, "loopback interface {LOOPBACK} must exist");
+        index
+    }
+
     #[tokio::test]
     async fn bind_accepts_str_literal() {
         IcmpSocket::bind("127.0.0.1").await.unwrap();
@@ -471,6 +430,18 @@ mod tests {
     #[tokio::test]
     async fn bind_accepts_ip_addr() {
         IcmpSocket::bind(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bind_accepts_scoped_ipv6_str() {
+        // There is no portable named-zone bind target: Linux loopback has
+        // no link-local address, and glibc's getaddrinfo rejects named
+        // zones on non-link-local addresses such as `::1`. A numeric zone
+        // still exercises scope-id plumbing into the bind address; named
+        // zone resolution is covered by `addr::tests`.
+        IcmpSocket::bind(format!("::1%{}", loopback_scope_id()))
             .await
             .unwrap();
     }
@@ -503,5 +474,15 @@ mod tests {
     async fn connect_accepts_ip_addr() {
         let sock = IcmpSocket::bind(Ipv4Addr::LOCALHOST).await.unwrap();
         sock.connect(IpAddr::V4(Ipv4Addr::LOCALHOST)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_accepts_scoped_tuple() {
+        // Linux loopback has no link-local address, so connecting `fe80::1`
+        // fails there with ENETUNREACH. Scoped `::1` connects on all
+        // platforms while still plumbing the scope id into the sockaddr.
+        let scoped = (Ipv6Addr::LOCALHOST, loopback_scope_id());
+        let sock = IcmpSocket::bind(Ipv6Addr::UNSPECIFIED).await.unwrap();
+        sock.connect(scoped).await.unwrap();
     }
 }

@@ -20,7 +20,8 @@
     clippy::cast_sign_loss
 )]
 
-/// Conversion from various inputs (IP addresses, hostnames) into [`std::net::IpAddr`].
+/// Conversion from various inputs (IP addresses, hostnames) into
+/// [`HostAddr`](addr::HostAddr), preserving IPv6 scope (zone) identifiers.
 pub mod addr;
 mod net;
 mod stats;
@@ -41,12 +42,12 @@ use std::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::net::SocketAddrV4;
 
+pub use addr::{HostAddr, ToHostAddr};
 pub use net::IcmpSocket;
 use net::SocketType;
 use socket2::{MaybeUninitSlice, MsgHdrMut, SockAddr};
 use tokio::time::timeout;
 
-use crate::addr::ToIpAddr;
 use crate::stats::compute_rtt_stats;
 
 const IP_HEADER_SIZE: usize = 20;
@@ -167,12 +168,15 @@ pub struct IcmpEchoReply {
 /// Automatically selects ICMPv4 or ICMPv6 based on the resolved address family
 /// of `dest`. The socket is bound to `src` (typically `UNSPECIFIED`) before
 /// connecting.
+/// IPv6 scope (zone) identifiers are preserved end to end.
 ///
 /// # Arguments
 ///
 /// * `src` — Local address to bind the raw socket to (e.g. `Ipv4Addr::UNSPECIFIED`).
-/// * `dest` — Destination host; any type that implements [`ToIpAddr`] is accepted
-///   (IP address, hostname string, etc.).
+/// * `dest` — Destination host; any type that implements [`ToHostAddr`] is accepted
+///   (IP address, scoped IPv6 literal such as `"fe80::1%eth0"`, hostname string, etc.).
+///   Note: [`IpAddr`](std::net::IpAddr) and [`Ipv6Addr`] cannot carry a scope id —
+///   use a `&str` or `(Ipv6Addr, u32)` tuple for link-local destinations.
 /// * `count` — Number of ICMP echo requests to send.
 /// * `interval` — How long to wait between sending successive echo requests.
 /// * `size` — Total ICMP payload size in bytes. The first 8 bytes are reserved
@@ -186,16 +190,14 @@ pub struct IcmpEchoReply {
 /// * Only expiration of a probe's reply deadline after a successful send is
 ///   counted as packet loss. OS-reported I/O errors are propagated even if
 ///   their kind is [`std::io::ErrorKind::TimedOut`].
-pub async fn ping<A: ToIpAddr>(
-    src: A,
-    dest: A,
+pub async fn ping<S: ToHostAddr, D: ToHostAddr>(
+    src: S,
+    dest: D,
     count: u32,
     interval: Duration,
     size: u16,
 ) -> std::io::Result<PingStats> {
-    use std::net::IpAddr;
-
-    let dest = dest.to_ip_addr().await?;
+    let dest = dest.to_host_addr().await?;
     let ts_len = time::Timestamp::len();
     if (size as usize) <= ts_len {
         return Err(std::io::Error::new(
@@ -214,10 +216,10 @@ pub async fn ping<A: ToIpAddr>(
         let payload = &payload;
         async move {
             match dest {
-                IpAddr::V4(_) => probe_icmp_echo_v4(socket, payload, seq, tout)
+                HostAddr::V4(_) => probe_icmp_echo_v4(socket, payload, seq, tout)
                     .await
                     .map(|outcome| outcome.map(|r| r.rtt)),
-                IpAddr::V6(_) => probe_icmp_echo_v6(socket, payload, seq, tout)
+                HostAddr::V6 { .. } => probe_icmp_echo_v6(socket, payload, seq, tout)
                     .await
                     .map(|outcome| outcome.map(|r| r.rtt)),
             }
