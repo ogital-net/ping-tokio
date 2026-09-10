@@ -64,6 +64,9 @@ All operational errors (including send/receive errors and OS-reported timeouts)
 abort the run and are returned without partial statistics. `packets_tx` counts
 complete requests accepted by the local socket, not confirmed network delivery.
 
+Each probe waits up to `DEFAULT_TIMEOUT` (5 seconds) for a matching reply. Use
+`ping_with_timeout` to set an explicit per-probe deadline.
+
 ---
 
 ### Low-level API

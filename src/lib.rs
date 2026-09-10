@@ -156,11 +156,18 @@ pub struct IcmpEchoReply {
     pub rtt: Duration,
 }
 
+/// Default per-probe reply deadline used by [`ping`]: 5 seconds.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Send a series of ICMP echo requests to `dest` and return aggregate statistics.
 ///
 /// Selects ICMPv4 or ICMPv6 from the resolved address family of `dest`.
 /// The socket is bound to `src` (typically `UNSPECIFIED`) before connecting.
 /// IPv6 scope (zone) identifiers are preserved end to end.
+///
+/// Each probe waits up to [`DEFAULT_TIMEOUT`] for a matching reply; an
+/// expired deadline counts as packet loss. Use [`ping_with_timeout`] to tune
+/// the deadline.
 ///
 /// # Arguments
 ///
@@ -189,6 +196,31 @@ pub async fn ping<S: ToHostAddr, D: ToHostAddr>(
     interval: Duration,
     size: u16,
 ) -> std::io::Result<PingStats> {
+    ping_with_timeout(src, dest, count, interval, size, DEFAULT_TIMEOUT).await
+}
+
+/// Send a series of ICMP echo requests with a configurable reply deadline.
+///
+/// Identical to [`ping`], except that each probe's reply deadline is
+/// `timeout` instead of [`DEFAULT_TIMEOUT`].
+///
+/// # Arguments
+///
+/// * `src`, `dest`, `count`, `interval`, `size` - as documented for [`ping`].
+/// * `timeout` - Maximum time to wait for each probe's reply once the request
+///   has been sent. An expired deadline counts as packet loss, not an error.
+///
+/// # Errors
+///
+/// As documented for [`ping`].
+pub async fn ping_with_timeout<S: ToHostAddr, D: ToHostAddr>(
+    src: S,
+    dest: D,
+    count: u32,
+    interval: Duration,
+    size: u16,
+    timeout: Duration,
+) -> std::io::Result<PingStats> {
     // Validate before resolving: an invalid `size` must fail with
     // `InvalidInput` without paying for a DNS lookup.
     let ts_len = time::Timestamp::len();
@@ -200,7 +232,6 @@ pub async fn ping<S: ToHostAddr, D: ToHostAddr>(
     }
     let dest = dest.to_host_addr().await?;
     let payload = generate_payload(size as usize - ts_len);
-    let tout = Duration::from_secs(5);
 
     let socket = IcmpSocket::bind(src).await?;
     socket.connect(dest).await?;
@@ -210,10 +241,10 @@ pub async fn ping<S: ToHostAddr, D: ToHostAddr>(
         let payload = &payload;
         async move {
             match dest {
-                HostAddr::V4(_) => probe_icmp_echo_v4(socket, payload, seq, tout)
+                HostAddr::V4(_) => probe_icmp_echo_v4(socket, payload, seq, timeout)
                     .await
                     .map(|outcome| outcome.map(|r| r.rtt)),
-                HostAddr::V6 { .. } => probe_icmp_echo_v6(socket, payload, seq, tout)
+                HostAddr::V6 { .. } => probe_icmp_echo_v6(socket, payload, seq, timeout)
                     .await
                     .map(|outcome| outcome.map(|r| r.rtt)),
             }
@@ -957,6 +988,29 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn ping_with_timeout_loopback_counts() {
+        for host in ["127.0.0.1", "::1"] {
+            let stats =
+                ping_with_timeout(host, host, 2, Duration::ZERO, 64, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+            assert_eq!(stats.packets_tx, 2);
+            assert_eq!(stats.packets_rx, 2);
+            assert!(stats.rtt_min > Duration::ZERO);
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_uses_default_timeout() {
+        assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(5));
+        let stats = ping("127.0.0.1", "127.0.0.1", 1, Duration::ZERO, 64)
+            .await
+            .unwrap();
+        assert_eq!(stats.packets_tx, 1);
+        assert_eq!(stats.packets_rx, 1);
     }
 
     /// Build a full IPv4 packet wrapping an ICMP echo reply whose payload
