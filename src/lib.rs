@@ -19,7 +19,7 @@
 )]
 
 /// Conversion from various inputs (IP addresses, hostnames) into
-/// [`HostAddr`](addr::HostAddr), preserving IPv6 scope (zone) identifiers.
+/// [`HostAddr`], preserving IPv6 scope (zone) identifiers.
 pub mod addr;
 mod net;
 mod stats;
