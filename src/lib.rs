@@ -49,6 +49,8 @@ use tokio::time::timeout;
 use crate::stats::compute_rtt_stats;
 
 const IP_HEADER_SIZE: usize = 20;
+/// Upper bound on the IPv4 header size, including options (4-bit IHL field).
+const MAX_IP_HEADER_SIZE: usize = 60;
 const ICMP_HEADER_SIZE: usize = 8;
 
 const ICMP_ECHO_REQUEST: u8 = 8;
@@ -324,13 +326,14 @@ async fn probe_icmp_echo_v4(
     let dgram_strips_ip_header = false;
     let use_dgram_recv = sock_type == SocketType::Dgram && dgram_strips_ip_header;
 
-    // Single buffer for send and receive. When received data includes the IP
-    // header (`Raw` sockets and Apple `DGRAM` sockets), add 20 bytes.
+    // Single buffer for send and receive. When received data includes the
+    // IP header (`Raw` sockets and Apple `DGRAM` sockets), size for the
+    // maximum header (60 bytes): IPv4 options must not truncate a reply.
     let icmp_len = ICMP_HEADER_SIZE + ts_len + payload.len();
     let buf_cap = if use_dgram_recv {
         icmp_len
     } else {
-        IP_HEADER_SIZE + icmp_len
+        MAX_IP_HEADER_SIZE + icmp_len
     };
     let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
 
@@ -364,54 +367,82 @@ async fn send_icmp_echo_v4_raw(
     mut buf: Vec<u8>,
     tout: Duration,
 ) -> std::io::Result<ProbeOutcome<IcmpEchoReply>> {
-    let ts_len = time::Timestamp::len();
-
     wait_for_reply(tout, async {
         loop {
             buf.clear();
             let received = socket.recv(buf.spare_capacity_mut()).await?;
             unsafe { buf.set_len(received) };
-            if received < IP_HEADER_SIZE + ICMP_HEADER_SIZE + ts_len {
-                continue;
+            if let Some(reply) = parse_ipv4_reply(&buf[..received], req_id, seq, sent_ts_bytes) {
+                return Ok(reply);
             }
-            let msg_type = buf[IP_HEADER_SIZE];
-            if msg_type != ICMP_ECHO_REPLY {
-                continue;
-            }
-            let reply_id = u16::from_be_bytes([buf[IP_HEADER_SIZE + 4], buf[IP_HEADER_SIZE + 5]]);
-            if req_id != reply_id {
-                continue;
-            }
-            let reply_seq = u16::from_be_bytes([buf[IP_HEADER_SIZE + 6], buf[IP_HEADER_SIZE + 7]]);
-            if reply_seq != seq {
-                continue;
-            }
-            let ts_start = IP_HEADER_SIZE + ICMP_HEADER_SIZE;
-            let ts_end = ts_start + ts_len;
-            if buf[ts_start..ts_end] != sent_ts_bytes {
-                continue;
-            }
-            let now = time::Timestamp::now();
-            let src_addr = Ipv4Addr::new(
-                buf[IP_HEADER_SIZE - 8],
-                buf[IP_HEADER_SIZE - 7],
-                buf[IP_HEADER_SIZE - 6],
-                buf[IP_HEADER_SIZE - 5],
-            );
-            let reply_ttl = buf[8];
-            let reply_ts =
-                time::Timestamp::from(<[u8; 8]>::try_from(&buf[ts_start..ts_end]).unwrap());
-            let rtt = now - reply_ts;
-            return Ok(IcmpEchoReply {
-                src_addr,
-                len: received - IP_HEADER_SIZE,
-                seq: reply_seq,
-                ttl: reply_ttl,
-                rtt,
-            });
         }
     })
     .await
+}
+
+/// Parse a full IPv4 packet (header + ICMP echo reply) received on a socket
+/// that delivers the IP header (`SOCK_RAW`, or Apple `SOCK_DGRAM`).
+///
+/// The IP header length is taken from the IHL field, so replies carrying IP
+/// options are matched correctly. Returns `None` for packets that are not a
+/// well-formed IPv4 echo reply matching `req_id` / `seq` / `sent_ts_bytes`.
+fn parse_ipv4_reply(
+    packet: &[u8],
+    req_id: u16,
+    seq: u16,
+    sent_ts_bytes: [u8; 8],
+) -> Option<IcmpEchoReply> {
+    let ts_len = time::Timestamp::len();
+
+    // Byte 0 holds the version and the Internet Header Length (IHL, in
+    // 32-bit words). Only IPv4 packets with a header within the datagram
+    // are considered.
+    let version = packet.first()? >> 4;
+    if version != 4 {
+        return None;
+    }
+    let ip_header_len = usize::from(packet[0] & 0x0f) * 4;
+    if !(IP_HEADER_SIZE..=MAX_IP_HEADER_SIZE).contains(&ip_header_len) {
+        return None;
+    }
+
+    // The IP total-length field bounds the packet; any excess bytes in the
+    // receive buffer (e.g. link-layer padding) are ignored.
+    let total_len = usize::from(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]));
+    if total_len < ip_header_len || packet.len() < total_len {
+        return None;
+    }
+    let icmp_len = total_len - ip_header_len;
+    if icmp_len < ICMP_HEADER_SIZE + ts_len {
+        return None;
+    }
+    let icmp = &packet[ip_header_len..total_len];
+
+    if icmp[0] != ICMP_ECHO_REPLY {
+        return None;
+    }
+    let reply_id = u16::from_be_bytes([icmp[4], icmp[5]]);
+    if req_id != reply_id {
+        return None;
+    }
+    let reply_seq = u16::from_be_bytes([icmp[6], icmp[7]]);
+    if reply_seq != seq {
+        return None;
+    }
+    if icmp[ICMP_HEADER_SIZE..ICMP_HEADER_SIZE + ts_len] != sent_ts_bytes {
+        return None;
+    }
+    let now = time::Timestamp::now();
+    let reply_ts = time::Timestamp::from(
+        <[u8; 8]>::try_from(&icmp[ICMP_HEADER_SIZE..ICMP_HEADER_SIZE + ts_len]).unwrap(),
+    );
+    Some(IcmpEchoReply {
+        src_addr: Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
+        len: icmp_len,
+        seq: reply_seq,
+        ttl: packet[8],
+        rtt: now - reply_ts,
+    })
 }
 
 /// Receive path for header-stripping `SOCK_DGRAM` ping sockets (Linux/Android):
@@ -908,6 +939,118 @@ mod tests {
         assert_eq!(stats.packets_tx, 0);
         assert_eq!(stats.packets_rx, 0);
         assert_eq!(stats.rtt_avg, Duration::ZERO);
+    }
+
+    /// Build a full IPv4 packet wrapping an ICMP echo reply whose payload
+    /// starts with `ts`. The checksum fields are left zero; the receive
+    /// path does not verify them.
+    fn ipv4_echo_reply_packet(
+        ihl_words: u8,
+        options_pad: u8,
+        id: u16,
+        seq: u16,
+        ts: [u8; 8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let ip_header_len = usize::from(ihl_words) * 4;
+        assert!(ip_header_len >= IP_HEADER_SIZE);
+        assert_eq!(ip_header_len % 4, 0);
+        let icmp_len = ICMP_HEADER_SIZE + ts.len() + payload.len();
+        let total_len = ip_header_len + icmp_len;
+        let mut packet = vec![0u8; total_len];
+        packet[0] = (4 << 4) | ihl_words;
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[8] = 64; // ttl
+        packet[9] = 1; // protocol: ICMP
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]); // src addr
+        for b in &mut packet[IP_HEADER_SIZE..ip_header_len] {
+            *b = options_pad;
+        }
+        let icmp = &mut packet[ip_header_len..];
+        icmp[0] = ICMP_ECHO_REPLY;
+        icmp[4..6].copy_from_slice(&id.to_be_bytes());
+        icmp[6..8].copy_from_slice(&seq.to_be_bytes());
+        icmp[ICMP_HEADER_SIZE..ICMP_HEADER_SIZE + ts.len()].copy_from_slice(&ts);
+        icmp[ICMP_HEADER_SIZE + ts.len()..].copy_from_slice(payload);
+        packet
+    }
+
+    #[test]
+    fn parse_ipv4_reply_matches_minimal_header() {
+        let ts = time::Timestamp::now().as_bytes();
+        let packet = ipv4_echo_reply_packet(5, 0, 0x1234, 7, ts, &[1, 2, 3]);
+        let reply = parse_ipv4_reply(&packet, 0x1234, 7, ts).unwrap();
+        assert_eq!(reply.src_addr, Ipv4Addr::new(192, 0, 2, 1));
+        assert_eq!(reply.len, ICMP_HEADER_SIZE + 8 + 3);
+        assert_eq!(reply.seq, 7);
+        assert_eq!(reply.ttl, 64);
+    }
+
+    #[test]
+    fn parse_ipv4_reply_matches_header_with_options() {
+        let ts = time::Timestamp::now().as_bytes();
+        // 40-byte IP header: 5 option words filled with NOP (0x01) options.
+        let packet = ipv4_echo_reply_packet(10, 0x01, 0x1234, 7, ts, &[9; 4]);
+        let reply = parse_ipv4_reply(&packet, 0x1234, 7, ts).unwrap();
+        assert_eq!(reply.src_addr, Ipv4Addr::new(192, 0, 2, 1));
+        assert_eq!(reply.len, ICMP_HEADER_SIZE + 8 + 4);
+        assert_eq!(reply.seq, 7);
+        assert_eq!(reply.ttl, 64);
+    }
+
+    #[test]
+    fn parse_ipv4_reply_matches_maximum_header() {
+        let ts = time::Timestamp::now().as_bytes();
+        let packet = ipv4_echo_reply_packet(15, 0x01, 0x1234, 7, ts, &[]);
+        assert!(parse_ipv4_reply(&packet, 0x1234, 7, ts).is_some());
+    }
+
+    #[test]
+    fn parse_ipv4_reply_rejects_invalid_headers() {
+        let ts = time::Timestamp::now().as_bytes();
+
+        // Wrong IP version.
+        let mut packet = ipv4_echo_reply_packet(5, 0, 0x1234, 7, ts, &[]);
+        packet[0] = (6 << 4) | 5;
+        assert!(parse_ipv4_reply(&packet, 0x1234, 7, ts).is_none());
+
+        // IHL below the 20-byte minimum.
+        let mut packet = ipv4_echo_reply_packet(5, 0, 0x1234, 7, ts, &[]);
+        packet[0] = (4 << 4) | 4;
+        assert!(parse_ipv4_reply(&packet, 0x1234, 7, ts).is_none());
+
+        // IHL larger than the received datagram.
+        let mut packet = ipv4_echo_reply_packet(6, 0x01, 0x1234, 7, ts, &[]);
+        packet.truncate(packet.len() - 4);
+        assert!(parse_ipv4_reply(&packet, 0x1234, 7, ts).is_none());
+
+        // Total length smaller than the IP header.
+        let mut packet = ipv4_echo_reply_packet(5, 0, 0x1234, 7, ts, &[]);
+        packet[2..4].copy_from_slice(&19u16.to_be_bytes());
+        assert!(parse_ipv4_reply(&packet, 0x1234, 7, ts).is_none());
+
+        // Truncated ICMP message (timestamp does not fit).
+        let mut packet = ipv4_echo_reply_packet(5, 0, 0x1234, 7, ts, &[]);
+        let new_len = packet.len() - 4;
+        packet[2..4].copy_from_slice(&(new_len as u16).to_be_bytes());
+        packet.truncate(new_len);
+        assert!(parse_ipv4_reply(&packet, 0x1234, 7, ts).is_none());
+    }
+
+    #[test]
+    fn parse_ipv4_reply_rejects_mismatches() {
+        let ts = time::Timestamp::now().as_bytes();
+        let packet = ipv4_echo_reply_packet(5, 0, 0x1234, 7, ts, &[]);
+
+        // Wrong id, sequence, or timestamp.
+        assert!(parse_ipv4_reply(&packet, 0x4321, 7, ts).is_none());
+        assert!(parse_ipv4_reply(&packet, 0x1234, 8, ts).is_none());
+        assert!(parse_ipv4_reply(&packet, 0x1234, 7, [0; 8]).is_none());
+
+        // Not an echo reply.
+        let mut other_type = packet.clone();
+        other_type[IP_HEADER_SIZE] = ICMP_ECHO_REQUEST;
+        assert!(parse_ipv4_reply(&other_type, 0x1234, 7, ts).is_none());
     }
 
     #[tokio::test]
